@@ -169,8 +169,8 @@ st.markdown("""
 div[data-testid="stAppViewContainer"]::before {
     content: "© 2026 Ranabir Bhakat™ · Proprietary & Confidential · Unauthorized use prohibited";
     position: fixed;
-    top: 15px;
-    right: 200px;
+    top: 14px;
+    right: 220px;
     z-index: 999999;
     padding: 6px 10px;
     border-radius: 8px;
@@ -1191,6 +1191,7 @@ else:
     with col_r2:
         st.markdown("#### Portfolio Risk Assessment")
         st.markdown(result["risk_assessment"])
+
 
 
 
