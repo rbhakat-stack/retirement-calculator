@@ -2,25 +2,136 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import hashlib
+import hmac
+
 
 # --- APP CONFIGURATION ---
 st.set_page_config(
     page_title="Strategic Retirement Planner",
     page_icon="💼",
-    layout="wide",
+    layout="centered",
     initial_sidebar_state="expanded"
 )
+
+
+# =========================
+# SIMPLE LOGIN GATE (USERID/PASSWORD)
+# =========================
+
+def _hash_password(password: str, salt: str) -> str:
+    """
+    PBKDF2 hash (reasonable for basic gating). Store only the hash in st.secrets.
+    """
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000,
+    )
+    return dk.hex()
+
+def require_login():
+    # Already authenticated
+    if st.session_state.get("is_authenticated", False):
+        return
+
+    st.title("Login Required")
+    st.caption("Enter your credentials to access the application.")
+
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("User ID")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+
+    if submitted:
+        # Read secrets
+        allowed_users = st.secrets.get("auth", {}).get("users", {})
+        salt = st.secrets.get("auth", {}).get("salt", "")
+
+        if not salt or not allowed_users:
+            st.error("Auth is not configured. Please add [auth] secrets (salt + users).")
+            st.stop()
+
+        # Validate user
+        expected_hash = allowed_users.get(username)
+        if not expected_hash:
+            st.error("Invalid User ID or Password.")
+            st.stop()
+
+        computed_hash = _hash_password(password, salt)
+
+        # Constant-time comparison
+        if hmac.compare_digest(computed_hash, expected_hash):
+            st.session_state.is_authenticated = True
+            st.success("Login successful.")
+            st.rerun()
+        else:
+            st.error("Invalid User ID or Password.")
+            st.stop()
+
+    # If not submitted or failed, block app
+    st.stop()
+
+require_login()
+
+# OPTIONAL: add a logout button somewhere (e.g., sidebar)
+with st.sidebar:
+    if st.button("Log out"):
+        st.session_state.is_authenticated = False
+        st.rerun()
+
+# ---- Your existing app continues below ----
+
 
 # --- GLOBAL STYLE OVERRIDES ---
 st.markdown("""
     <style>
-    /* Make the central content narrower and less "blog-like" */
+    /* =========================
+       MAIN CONTENT (NARROW)
+       ========================= */
     .main .block-container {
-        max-width: 1100px;
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
+        max-width: 960px;        /* ← adjust: 880–1024 is ideal */
+        padding-left: 2rem;
+        padding-right: 2rem;
+        margin-left: auto;
+        margin-right: auto;
     }
 
+    /* Prevent Streamlit responsive widening */
+    @media (min-width: 1200px) {
+        .main .block-container {
+            max-width: 960px;
+        }
+    }
+
+    /* =========================
+       SIDEBAR (WIDER + CLEANER)
+       ========================= */
+    section[data-testid="stSidebar"] {
+        width: 420px !important;       /* increase sidebar width */
+        min-width: 420px !important;
+    }
+
+    /* Sidebar inner padding */
+    section[data-testid="stSidebar"] > div {
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+    }
+
+    /* Sidebar: slightly smaller text (keep your existing intent) */
+    [data-testid="stSidebar"] {
+        font-size: 0.9rem !important;
+    }
+
+    /* Optional: subtle divider so sidebar feels like a panel */
+    section[data-testid="stSidebar"] {
+        border-right: 1px solid rgba(148, 163, 184, 0.15);
+    }
+
+    /* =========================
+       TYPOGRAPHY
+       ========================= */
     /* Reduce heading sizes so they feel more "report-like" */
     h1 {
         font-size: 1.6rem !important;
@@ -45,19 +156,38 @@ st.markdown("""
         color: #6B7280 !important;  /* neutral grey */
     }
 
-    /* Sidebar: slightly smaller text */
-    [data-testid="stSidebar"] {
-        font-size: 0.9rem !important;
-    }
-
     /* General text */
     .stMarkdown p {
         font-size: 0.9rem;
         line-height: 1.5;
     }
 
+
+/* =========================
+   TOP-RIGHT LEGAL BADGE
+   ========================= */
+div[data-testid="stAppViewContainer"]::before {
+    content: "© 2026 Ranabir Bhakat™ · Proprietary & Confidential · Unauthorized use prohibited";
+    position: fixed;
+    top: 20px;
+    right: 120px;
+    z-index: 999999;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    color: rgba(255, 255, 255, 0.92);
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+    pointer-events: none;
+}
+
     </style>
 """, unsafe_allow_html=True)
+
+
 
 # --- TITLE & INTRO ---
 st.title("Strategic Retirement Planner: Cashflow & Buckets")
@@ -1061,3 +1191,5 @@ else:
     with col_r2:
         st.markdown("#### Portfolio Risk Assessment")
         st.markdown(result["risk_assessment"])
+
+
