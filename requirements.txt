@@ -2,3 +2,4 @@ streamlit>=1.36
 pandas>=2.2
 numpy>=2.0
 matplotlib>=3.8
+supabase
