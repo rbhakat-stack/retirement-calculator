@@ -6,86 +6,229 @@ import hashlib
 import hmac
 import copy
 import uuid
-import json
 
-
-# =============================================================================
-# Helpers: rate normalization (store rates/yields as decimals internally)
-# =============================================================================
-def _as_decimal_rate(x, default=0.0) -> float:
-    """
-    Normalize any rate to decimal form.
-    Accepts:
-      - 0.07 (already decimal)
-      - 7 or 7.0 (percent)  -> 0.07
+# -----------------------------------------------------------------------------
+# RATE NORMALIZATION HELPERS (prevents percent/decimal confusion)
+# -----------------------------------------------------------------------------
+def _as_decimal_rate(x, default=0.0):
+    """Normalize any rate to decimal form.
+    Accepts 0.07 (already decimal) or 7/7.0 (percent) -> 0.07.
     """
     try:
         v = float(x)
     except Exception:
         return float(default)
-    return v / 100.0 if v > 1.0 else v
+    if v > 1.0:
+        return v / 100.0
+    return v
 
-
-def _as_percent_display(x, default_pct=0.0) -> float:
-    """
-    For slider default display (in percent units).
-    Accepts decimal or percent and returns percent number (e.g., 7.0).
+def _as_percent_display(x, default_pct=0.0):
+    """Return a percent-number for sliders (e.g., 0.07 -> 7.0).
+    Accepts decimal or percent.
     """
     d = _as_decimal_rate(x, default=default_pct / 100.0)
     return d * 100.0
 
 
-def normalize_snapshot(s: dict) -> dict:
+# ----------------------------------------------------------------------------- 
+# OPTIONAL SUPABASE PERSISTENCE (PER-USER)
+# ----------------------------------------------------------------------------- 
+# This enables saving/loading scenarios per authenticated user without changing
+# any app behavior when Supabase is not configured.
+try:
+    from supabase import create_client  # type: ignore
+except Exception:  # pragma: no cover
+    create_client = None  # type: ignore
+
+
+@st.cache_resource
+def _get_supabase_client():
+    cfg = st.secrets.get("supabase", {})
+    url = cfg.get("url", "")
+    key = cfg.get("service_role_key", "") or cfg.get("key", "")
+    if not url or not key or create_client is None:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def _sb_enabled() -> bool:
+    return _get_supabase_client() is not None
+
+
+def _sb_table() -> str:
+    return st.secrets.get("supabase", {}).get("table", "retirement_user_state")
+
+
+def _scenario_store_key() -> str:
+    # per-login separation in session_state
+    user = st.session_state.get("current_user") or "default"
+    return f"scenarios__{user}"
+
+
+def _single_snapshot_key() -> str:
+    user = st.session_state.get("current_user") or "default"
+    return f"single_snapshot__{user}"
+
+
+def _sb_json_sanitize(x):
+    """Convert common non-JSON types (numpy/pandas) into plain Python types."""
+    try:
+        import numpy as _np  # local import
+        if isinstance(x, (_np.integer,)):
+            return int(x)
+        if isinstance(x, (_np.floating,)):
+            return float(x)
+        if isinstance(x, (_np.ndarray,)):
+            return x.tolist()
+    except Exception:
+        pass
+
+    if isinstance(x, dict):
+        return {str(k): _sb_json_sanitize(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_sb_json_sanitize(v) for v in x]
+    return x
+
+
+def sb_load_user_state(user_id: str) -> dict | None:
+    """Return {'scenarios': [...], 'single_snapshot': {...}} or None."""
+    sb = _get_supabase_client()
+    if sb is None:
+        return None
+    table = _sb_table()
+    try:
+        resp = sb.table(table).select("user_id,scenarios,single_snapshot").eq("user_id", user_id).execute()
+        data = getattr(resp, "data", None) or []
+        if not data:
+            return None
+        row = data[0] if isinstance(data, list) else data
+        return {
+            "scenarios": row.get("scenarios") or [],
+            "single_snapshot": row.get("single_snapshot") or {},
+        }
+    except Exception:
+        return None
+
+
+def sb_save_user_state(user_id: str, scenarios: list, single_snapshot: dict | None = None) -> bool:
+    """Upsert user state. Safe no-op if Supabase not configured."""
+    sb = _get_supabase_client()
+    if sb is None:
+        return False
+    table = _sb_table()
+    payload = {
+        "user_id": str(user_id),
+        "scenarios": _sb_json_sanitize(scenarios),
+    }
+    if single_snapshot is not None:
+        payload["single_snapshot"] = _sb_json_sanitize(single_snapshot)
+
+    # Some schemas use 'single_inputs' instead of 'single_snapshot'. Attempt both.
+    try:
+        sb.table(table).upsert(payload, on_conflict="user_id").execute()
+        return True
+    except Exception:
+        if single_snapshot is None:
+            return False
+        try:
+            payload2 = {
+                "user_id": str(user_id),
+                "scenarios": _sb_json_sanitize(scenarios),
+                "single_inputs": _sb_json_sanitize(single_snapshot),
+            }
+            sb.table(table).upsert(payload2, on_conflict="user_id").execute()
+            return True
+        except Exception:
+            return False
+
+
+def _ensure_user_state_loaded():
+    """Load saved state (single inputs + scenarios) from Supabase into session_state once per login.
+
+    Critical detail: several sidebar widgets store *percent* values in st.session_state
+    (because they are created as sliders in % units). In Supabase we store rates as *decimals*.
+    Therefore, when restoring into st.session_state we must convert decimals -> percent
+    for those widget keys, otherwise Streamlit will ignore/reset out-of-range defaults.
     """
-    Returns a NEW dict with consistent units and required keys.
-    All rates/yields stored as decimals.
-    """
-    s2 = copy.deepcopy(s)
+    user = st.session_state.get("current_user")
+    if not user:
+        return
 
-    # Core rates
-    s2["inflation_rate"] = _as_decimal_rate(s2.get("inflation_rate", 0.03), 0.03)
-    s2["pre_retire_return"] = _as_decimal_rate(s2.get("pre_retire_return", 0.07), 0.07)
-    s2["post_retire_return"] = _as_decimal_rate(s2.get("post_retire_return", 0.045), 0.045)
+    already_loaded = st.session_state.get("_sb_state_loaded", False) and st.session_state.get("_sb_loaded_user") == user
+    if already_loaded:
+        return
 
-    # Multi-asset yields
-    s2["cash_yield"] = _as_decimal_rate(s2.get("cash_yield", 0.04), 0.04)
-    s2["bonds_yield"] = _as_decimal_rate(s2.get("bonds_yield", 0.05), 0.05)
-    s2["etfs_yield"] = _as_decimal_rate(s2.get("etfs_yield", 0.07), 0.07)
-    s2["k401_yield"] = _as_decimal_rate(s2.get("k401_yield", 0.07), 0.07)
+        st.session_state["_sb_state_loaded"] = True
+        return
 
-    # Defaults / required keys
-    s2["use_multi_asset"] = bool(s2.get("use_multi_asset", True))
-    s2["flow_mode"] = s2.get("flow_mode", "cash_first")
-    if s2["flow_mode"] not in ("cash_first", "pro_rata"):
-        s2["flow_mode"] = "cash_first"
+    saved = sb_load_user_state(user)
+    if not saved:
+        st.session_state["_sb_state_loaded"] = True
+        return
 
-    # Ensure numeric types for critical fields (avoid strings)
-    for k in ["current_age", "retire_age", "life_expectancy", "ss_start_age", "dependents"]:
-        if k in s2 and s2[k] is not None:
-            s2[k] = int(s2[k])
+    # 1) Restore scenarios list (used by Compare tab)
+    scenarios = saved.get("scenarios") or []
+    if isinstance(scenarios, list):
+        st.session_state["scenarios"] = copy.deepcopy(scenarios)
 
-    for k in [
-        "annual_spend_retirement",
-        "social_security",
-        "annual_contribution",
-        "current_portfolio",
-        "cash_bal",
-        "bonds_bal",
-        "etfs_bal",
-        "k401_bal",
-        "annual_gross_income",
-        "manual_state_rate",
-        "annual_expenses",
-    ]:
-        if k in s2 and s2[k] is not None:
-            s2[k] = float(s2[k])
+    # 2) Restore Single Scenario inputs into the widget keys (used by sidebar)
+    single = saved.get("single_snapshot") or {}
+    if isinstance(single, dict) and single:
+        # Helper: clamp percent defaults to widget ranges to avoid Streamlit resetting them.
+        def _clamp(v, lo, hi):
+            try:
+                v = float(v)
+            except Exception:
+                return lo
+            return max(lo, min(hi, v))
 
-    return s2
+        # Keys that are sliders in the sidebar (percent units in session_state)
+        percent_widget_keys = {
+            "inflation_rate": (1.0, 5.0),
+            "pre_retire_return": (1.0, 12.0),
+            "post_retire_return": (1.0, 10.0),
+            "cash_yield": (0.0, 8.0),
+            "bonds_yield": (0.0, 10.0),
+            "etfs_yield": (0.0, 12.0),
+            "k401_yield": (0.0, 12.0),
+        }
+
+        for k, v in single.items():
+            if k in percent_widget_keys:
+                lo, hi = percent_widget_keys[k]
+                pct = _clamp(float(v) * 100.0, lo, hi)  # decimals -> %
+                if k not in st.session_state:
+                    st.session_state[k] = pct
+            else:
+                if k not in st.session_state:
+                    st.session_state[k] = v
+
+    st.session_state["_sb_state_loaded"] = True
+    st.session_state["_sb_loaded_user"] = user
 
 
-# =============================================================================
+def _maybe_persist_single_snapshot(snapshot: dict):
+    """Persist the current single-scenario inputs for the logged-in user."""
+    user = st.session_state.get("current_user")
+    if not user:
+        return
+    try:
+        # Keep rates normalized in storage
+        snap = normalize_snapshot(snapshot)
+        # Save current scenarios too (so a user always restores a coherent set)
+        scenarios = copy.deepcopy(st.session_state.get("scenarios", []))
+        sb_save_user_state(user, single_snapshot=snap, scenarios=scenarios)
+    except Exception:
+        # Do not break the app if persistence fails
+        return
+
+
+# -----------------------------------------------------------------------------
 # APP CONFIGURATION
-# =============================================================================
+# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Strategic Retirement Planner",
     page_icon="💼",
@@ -93,9 +236,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # SIMPLE LOGIN GATE (USERID/PASSWORD)
-# =============================================================================
+# -----------------------------------------------------------------------------
 def _hash_password(password: str, salt: str) -> str:
     """
     PBKDF2 hash (basic gating). Store only the hash in st.secrets.
@@ -149,16 +292,20 @@ def require_login():
 
 
 require_login()
+_ensure_user_state_loaded()
 
 with st.sidebar:
     if st.button("Log out"):
         st.session_state.is_authenticated = False
         st.session_state.current_user = None
+        # Force a fresh load from Supabase on next login
+        st.session_state["_sb_state_loaded"] = False
+        st.session_state["_sb_loaded_user"] = None
         st.rerun()
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # GLOBAL STYLE OVERRIDES (incl. legal badge)
-# =============================================================================
+# -----------------------------------------------------------------------------
 st.markdown(
     """
     <style>
@@ -232,9 +379,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # TAX LOGIC
-# =============================================================================
+# -----------------------------------------------------------------------------
 FEDERAL_BRACKETS = {
     "single": [
         {"limit": 11_600, "rate": 0.10},
@@ -337,9 +484,9 @@ def calculate_annual_taxes(
     }
 
 
-# =============================================================================
-# MULTI-ASSET FORECAST
-# =============================================================================
+# -----------------------------------------------------------------------------
+# MULTI-ASSET FORECAST (your existing logic, unchanged)
+# -----------------------------------------------------------------------------
 def calculate_forecast_multi_asset(
     current_age: int,
     retire_age: int,
@@ -494,35 +641,33 @@ def calculate_forecast_multi_asset(
                     "End Balance": total_pool(),
                 }
             )
-
         if total_pool() <= 0:
-            # Record a depletion row even if depletion occurs mid-year so KPIs/Compare show the correct depletion age.
-            depleted_age = age_int
-            row_payload = {
-                "Age": depleted_age,
-                "Is Retired": depleted_age >= retire_age,
-                "Required Spend": m_spend * 12.0,
-                "Guaranteed Income": guaranteed_month * 12.0,
-                "Portfolio Withdrawal": monthly_need * 12.0,
-                "Cash": 0.0,
-                "Bonds": 0.0,
-                "ETFs": 0.0,
-                "401k": 0.0,
-                "End Balance": 0.0,
-            }
-            if rows and rows[-1].get("Age") == depleted_age:
-                rows[-1].update(row_payload)
-            else:
-                rows.append(row_payload)
+            # If depletion happens mid-year, capture a final row so KPIs can detect depletion age
+            if month % 12 != 0:
+                rows.append(
+                    {
+                        "Age": age_int,
+                        "Is Retired": age_int >= retire_age,
+                        "Required Spend": m_spend * 12.0,
+                        "Guaranteed Income": guaranteed_month * 12.0,
+                        "Portfolio Withdrawal": monthly_need * 12.0,
+                        "Cash": cash,
+                        "Bonds": bonds,
+                        "ETFs": etfs,
+                        "401k": k401,
+                        "End Balance": 0.0,
+                    }
+                )
             break
 
     return pd.DataFrame(rows)
 
 
-# =============================================================================
-# SCENARIO MANAGER (COMPARE) - PER USER + SAFE COPIES
-# =============================================================================
+# -----------------------------------------------------------------------------
+# SCENARIO MANAGER (COMPARE)
+# -----------------------------------------------------------------------------
 def _scenario_store_key() -> str:
+    # per-login separation in session_state
     user = st.session_state.get("current_user") or "default"
     return f"scenarios__{user}"
 
@@ -534,18 +679,25 @@ def _init_scenarios():
 
 
 def _get_scenarios():
-    # Always return a deep copy so editing doesn't mutate stored objects accidentally.
-    return copy.deepcopy(st.session_state.get(_scenario_store_key(), []))
+    return st.session_state[_scenario_store_key()]
 
 
 def _set_scenarios(scenarios):
-    # Always store a deep copy for safety.
+    # Always store a deep copy for safety
     st.session_state[_scenario_store_key()] = copy.deepcopy(scenarios)
+
+    # Best-effort persistence (does nothing if Supabase is not configured)
+    user = st.session_state.get("current_user") or "default"
+    try:
+        sb_save_user_state(user, st.session_state[_scenario_store_key()], single_snapshot=st.session_state.get(_single_snapshot_key()))
+    except Exception:
+        pass
 
 
 def get_current_inputs_snapshot() -> dict:
     """
     Snapshot current widgets via session_state keys.
+    These keys are set on the sidebar inputs below.
     """
     return {
         "current_age": int(st.session_state.get("current_age", 50)),
@@ -578,8 +730,56 @@ def get_current_inputs_snapshot() -> dict:
     }
 
 
+import copy
+
+def _as_decimal_rate(x, default=0.0):
+    """
+    Normalize any rate to decimal.
+    - 0.07 stays 0.07
+    - 7 becomes 0.07
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return float(default)
+    return v / 100.0 if v > 1.0 else v
+
+def normalize_snapshot(s: dict) -> dict:
+    """Return a NEW snapshot with consistent units (rates as decimals)."""
+    s2 = copy.deepcopy(s)
+
+    # Core rates
+    s2["inflation_rate"] = _as_decimal_rate(s2.get("inflation_rate", 0.03), 0.03)
+    s2["pre_retire_return"] = _as_decimal_rate(s2.get("pre_retire_return", 0.07), 0.07)
+    s2["post_retire_return"] = _as_decimal_rate(s2.get("post_retire_return", 0.045), 0.045)
+
+    # Multi-asset yields
+    s2["cash_yield"] = _as_decimal_rate(s2.get("cash_yield", 0.04), 0.04)
+    s2["bonds_yield"] = _as_decimal_rate(s2.get("bonds_yield", 0.05), 0.05)
+    s2["etfs_yield"] = _as_decimal_rate(s2.get("etfs_yield", 0.07), 0.07)
+    s2["k401_yield"] = _as_decimal_rate(s2.get("k401_yield", 0.07), 0.07)
+
+    # Defaults / required keys
+    s2["use_multi_asset"] = bool(s2.get("use_multi_asset", True))
+    s2["flow_mode"] = s2.get("flow_mode", "cash_first")
+    if s2["flow_mode"] not in ("cash_first", "pro_rata"):
+        s2["flow_mode"] = "cash_first"
+
+    # Ensure numeric types for critical fields (avoid strings)
+    for k in ["current_age", "retire_age", "life_expectancy", "ss_start_age"]:
+        if k in s2:
+            s2[k] = int(s2[k])
+
+    for k in ["annual_spend_retirement", "social_security", "annual_contribution", "current_portfolio",
+              "cash_bal", "bonds_bal", "etfs_bal", "k401_bal"]:
+        if k in s2 and s2[k] is not None:
+            s2[k] = float(s2[k])
+
+    return s2
+
+
 def run_projection_from_snapshot(s: dict) -> pd.DataFrame:
-    # Normalize units on every run.
+    # --- CRITICAL: normalize units on every run ---
     s = normalize_snapshot(s)
 
     if s.get("use_multi_asset", True):
@@ -605,7 +805,7 @@ def run_projection_from_snapshot(s: dict) -> pd.DataFrame:
             flow_mode=s.get("flow_mode", "cash_first"),
         )
 
-    # Single-portfolio model
+    # --- single-portfolio model ---
     years = range(s["current_age"], s["life_expectancy"] + 1)
     data = []
     portfolio = float(s.get("current_portfolio", 0.0))
@@ -630,17 +830,15 @@ def run_projection_from_snapshot(s: dict) -> pd.DataFrame:
         end_bal = (start_bal + contribution - flexible_income_needed) * (1.0 + growth_rate)
         end_bal = max(0.0, end_bal)
 
-        data.append(
-            {
-                "Age": age,
-                "Is Retired": is_retired,
-                "Portfolio Start": start_bal,
-                "Required Spend": running_spend_needs,
-                "Guaranteed Income": guaranteed_income,
-                "Portfolio Withdrawal": flexible_income_needed,
-                "End Balance": end_bal,
-            }
-        )
+        data.append({
+            "Age": age,
+            "Is Retired": is_retired,
+            "Portfolio Start": start_bal,
+            "Required Spend": running_spend_needs,
+            "Guaranteed Income": guaranteed_income,
+            "Portfolio Withdrawal": flexible_income_needed,
+            "End Balance": end_bal,
+        })
 
         portfolio = end_bal
 
@@ -648,46 +846,21 @@ def run_projection_from_snapshot(s: dict) -> pd.DataFrame:
 
 
 def scenario_kpis(df: pd.DataFrame, retire_age: int, current_age: int, life_expectancy: int) -> dict:
-    """Compute headline KPIs for a scenario, with robust depletion detection.
-
-    Depletion is detected when:
-      - End Balance falls to ~0 (<= $1), OR
-      - the projection ends before life_expectancy (e.g., multi-asset sim stops early).
-    """
-    if df is None or df.empty:
-        return {
-            "Assets @ Retire": 0.0,
-            "Final Balance": 0.0,
-            "Depletion Age": "",
-            "Withdrawal Rate (1st yr)": 0.0,
-            "Sustainability": f"Depleted @ {current_age}",
-        }
-
-    eps = 1.0  # treat <= $1 as depleted to avoid float noise
-
     last_row = df.iloc[-1]
-    final_balance = float(last_row.get("End Balance", 0.0))
-    last_age = int(float(last_row.get("Age", life_expectancy)))
+    final_balance = float(last_row["End Balance"])
 
-    # Assets at retirement (prefer Portfolio Start when present; else End Balance)
     retire_row = df[df["Age"] == retire_age]
-    if not retire_row.empty:
-        rr = retire_row.iloc[0]
-        assets_at_retirement = float(rr.get("Portfolio Start", rr.get("End Balance", 0.0)))
-    else:
-        assets_at_retirement = 0.0
+    retire_row = retire_row.iloc[0] if not retire_row.empty else None
 
-    # Depletion age: first age where End Balance ~0
-    depletion_age = None
-    depleted_rows = df[(df["Age"] > current_age) & (df["End Balance"] <= eps)]
-    if not depleted_rows.empty:
-        depletion_age = int(float(depleted_rows["Age"].min()))
-    else:
-        # If the series ends before the horizon, treat the final age as depletion.
-        if last_age < int(life_expectancy):
-            depletion_age = last_age
+    assets_at_retirement = 0.0
+    if retire_row is not None:
+        assets_at_retirement = float(retire_row["Portfolio Start"]) if "Portfolio Start" in retire_row else float(
+            retire_row["End Balance"]
+        )
 
-    # First-year withdrawal rate at retirement
+    depletion_rows = df[(df["End Balance"] <= 0) & (df["Age"] > current_age)]
+    depletion_age = int(depletion_rows["Age"].min()) if not depletion_rows.empty else None
+
     retired_rows = df[df["Age"] >= retire_age]
     if not retired_rows.empty:
         first_ret = retired_rows.iloc[0]
@@ -697,12 +870,11 @@ def scenario_kpis(df: pd.DataFrame, retire_age: int, current_age: int, life_expe
     else:
         wr = 0.0
 
-    sustainability = f"Depleted @ {depletion_age}" if depletion_age is not None else f"Sustainable to {life_expectancy}"
-
+    sustainability = f"Depleted @ {depletion_age}" if depletion_age else f"Sustainable to {life_expectancy}"
     return {
         "Assets @ Retire": assets_at_retirement,
         "Final Balance": final_balance,
-        "Depletion Age": depletion_age if depletion_age is not None else "",
+        "Depletion Age": depletion_age if depletion_age else "",
         "Withdrawal Rate (1st yr)": wr,
         "Sustainability": sustainability,
     }
@@ -710,9 +882,9 @@ def scenario_kpis(df: pd.DataFrame, retire_age: int, current_age: int, life_expe
 
 _init_scenarios()
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # TITLE & INTRO
-# =============================================================================
+# -----------------------------------------------------------------------------
 st.title("Strategic Retirement Planner: Cashflow & Buckets")
 st.markdown(
     "Use this tool to test retirement readiness with **FIRE rules of thumb**, "
@@ -720,15 +892,18 @@ st.markdown(
 )
 st.markdown("---")
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # TABS: SINGLE vs COMPARE
-# =============================================================================
+# -----------------------------------------------------------------------------
 tab1, tab2 = st.tabs(["Single Scenario", "Compare Scenarios"])
 
 # =============================================================================
-# TAB 1: SINGLE SCENARIO
+# TAB 1: SINGLE SCENARIO (your app, minimally modified for keyed widgets)
 # =============================================================================
 with tab1:
+    # ---------------------------
+    # SIDEBAR INPUTS (KEYED)
+    # ---------------------------
     st.sidebar.header("1. Demographics & Status")
     current_age = st.sidebar.number_input("Current Age", 35, 90, 50, key="current_age")
     retire_age = st.sidebar.number_input("Retirement Age", 35, 90, 60, key="retire_age")
@@ -736,7 +911,9 @@ with tab1:
 
     st.sidebar.header("2. Financials (Current)")
     current_portfolio = st.sidebar.number_input("Total Invested Assets ($)", value=1_239_000, key="current_portfolio")
-    annual_contribution = st.sidebar.number_input("Annual Contribution until Retirement ($)", value=65_000, key="annual_contribution")
+    annual_contribution = st.sidebar.number_input(
+        "Annual Contribution until Retirement ($)", value=65_000, key="annual_contribution"
+    )
     annual_spend_retirement = st.sidebar.number_input(
         "Desired Annual Spend in Retirement (Today's $)", value=155_000, key="annual_spend_retirement"
     )
@@ -749,6 +926,7 @@ with tab1:
         key="use_multi_asset",
     )
 
+    flow_mode = "cash_first"
     with st.sidebar:
         flow_mode = st.selectbox(
             "Withdrawal Mode",
@@ -762,16 +940,16 @@ with tab1:
         st.sidebar.caption("Balances should roughly sum to Total Invested Assets (above). Yields are annual %.")
 
         cash_bal = st.sidebar.number_input("Cash Balance ($)", value=200_000, step=10_000, key="cash_bal")
-        cash_yield = st.sidebar.slider("Cash Yield (%)", 0.0, 8.0, 4.0, 0.1, key="cash_yield") / 100.0
+        cash_yield = st.sidebar.slider("Cash Yield (%)", 0.0, 8.0, 4.0, 0.1, key="cash_yield") / 100
 
         bonds_bal = st.sidebar.number_input("Bonds/Munis Balance ($)", value=400_000, step=10_000, key="bonds_bal")
-        bonds_yield = st.sidebar.slider("Bonds Yield (%)", 0.0, 10.0, 5.0, 0.1, key="bonds_yield") / 100.0
+        bonds_yield = st.sidebar.slider("Bonds Yield (%)", 0.0, 10.0, 5.0, 0.1, key="bonds_yield") / 100
 
         etfs_bal = st.sidebar.number_input("ETFs Balance ($)", value=439_000, step=10_000, key="etfs_bal")
-        etfs_yield = st.sidebar.slider("ETFs Return (%)", 0.0, 12.0, 7.0, 0.1, key="etfs_yield") / 100.0
+        etfs_yield = st.sidebar.slider("ETFs Return (%)", 0.0, 12.0, 7.0, 0.1, key="etfs_yield") / 100
 
         k401_bal = st.sidebar.number_input("401k Balance ($)", value=200_000, step=10_000, key="k401_bal")
-        k401_yield = st.sidebar.slider("401k Return (%)", 0.0, 12.0, 7.0, 0.1, key="k401_yield") / 100.0
+        k401_yield = st.sidebar.slider("401k Return (%)", 0.0, 12.0, 7.0, 0.1, key="k401_yield") / 100
 
         buckets_sum = cash_bal + bonds_bal + etfs_bal + k401_bal
         if abs(buckets_sum - current_portfolio) > 50_000:
@@ -780,6 +958,7 @@ with tab1:
                 "This is OK for experimentation, but totals may look inconsistent."
             )
     else:
+        # define placeholders so code below doesn't NameError
         cash_bal = bonds_bal = etfs_bal = k401_bal = 0.0
         cash_yield = bonds_yield = etfs_yield = k401_yield = 0.0
 
@@ -799,6 +978,7 @@ with tab1:
     if state_code == "Other":
         manual_state_rate = st.sidebar.slider("Other State Effective Tax Rate (%)", 0.0, 15.0, 5.0, 0.5, key="manual_state_rate")
     else:
+        # ensure key exists
         st.session_state["manual_state_rate"] = 0.0
 
     dependents = st.sidebar.number_input("Number of Dependents", 0, 10, 0, key="dependents")
@@ -807,15 +987,20 @@ with tab1:
     annual_expenses = st.sidebar.number_input("Annual Expenses (Today's $)", value=200_000, key="annual_expenses")
 
     st.sidebar.header("5. Macro & Return Assumptions")
-    inflation_rate = st.sidebar.slider("Inflation Rate (%)", 1.0, 5.0, 3.0, key="inflation_rate") / 100.0
-    pre_retire_return = st.sidebar.slider("Pre-Retirement Growth (%)", 1.0, 12.0, 7.0, key="pre_retire_return") / 100.0
-    post_retire_return = st.sidebar.slider("Post-Retirement Growth (Avg) (%)", 1.0, 10.0, 4.5, key="post_retire_return") / 100.0
+    inflation_rate = st.sidebar.slider("Inflation Rate (%)", 1.0, 5.0, 3.0, key="inflation_rate") / 100
+    pre_retire_return = st.sidebar.slider("Pre-Retirement Growth (%)", 1.0, 12.0, 7.0, key="pre_retire_return") / 100
+    post_retire_return = st.sidebar.slider("Post-Retirement Growth (Avg) (%)", 1.0, 10.0, 4.5, key="post_retire_return") / 100
 
     st.sidebar.header("6. Guaranteed Income (Retirement)")
     social_security = st.sidebar.number_input("Social Security/Pension (Annual $)", value=30_000, key="social_security")
     ss_start_age = st.sidebar.number_input("SS/Pension Start Age", 60, 75, 67, key="ss_start_age")
 
-    # Tax snapshot & household surplus
+    # Persist current single-scenario inputs per user (best-effort)
+    _maybe_persist_single_snapshot(normalize_snapshot(get_current_inputs_snapshot()))
+
+    # ---------------------------
+    # TAX SNAPSHOT & HOUSEHOLD SURPLUS
+    # ---------------------------
     tax_info = calculate_annual_taxes(
         gross_income=annual_gross_income,
         status=filing_status,
@@ -860,7 +1045,9 @@ with tab1:
     )
     st.markdown("---")
 
-    # Core retirement calculations
+    # ---------------------------
+    # CORE RETIREMENT CALCULATIONS
+    # ---------------------------
     if use_multi_asset:
         df = calculate_forecast_multi_asset(
             current_age=current_age,
@@ -898,14 +1085,14 @@ with tab1:
             if age >= ss_start_age:
                 guaranteed_income = social_security * ((1 + inflation_rate) ** (age - current_age))
 
-            flexible_income_needed = max(0.0, running_spend_needs - guaranteed_income) if is_retired else 0.0
+            flexible_income_needed = max(0, running_spend_needs - guaranteed_income) if is_retired else 0
 
             start_bal = portfolio
             growth_rate = post_retire_return if is_retired else pre_retire_return
-            contribution = annual_contribution if not is_retired else 0.0
+            contribution = annual_contribution if not is_retired else 0
 
             end_bal = (start_bal + contribution - flexible_income_needed) * (1 + growth_rate)
-            end_bal = max(0.0, end_bal)
+            end_bal = max(0, end_bal)
 
             data.append(
                 {
@@ -922,7 +1109,9 @@ with tab1:
 
         df = pd.DataFrame(data)
 
-    # FIRE overview
+    # ---------------------------
+    # SECTION 1: FIRE OVERVIEW
+    # ---------------------------
     st.header("1. FIRE Targets (Rule of Thumb)")
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -936,7 +1125,9 @@ with tab1:
     st.caption("These rules of thumb provide a quick readiness check before looking at detailed cashflow modeling.")
     st.markdown("---")
 
-    # Cashflow & longevity model
+    # ---------------------------
+    # SECTION 2: CASHFLOW & LONGEVITY MODEL
+    # ---------------------------
     st.header("2. Cashflow & Longevity Model")
 
     retirement_row = df[df["Age"] == retire_age]
@@ -1015,7 +1206,9 @@ with tab1:
 
     st.caption("This projection is deterministic and uses constant return and inflation assumptions. It is a planning tool, not a guarantee.")
 
-    # 3-Bucket strategy
+    # ---------------------------
+    # SECTION 3: 3-BUCKET STRATEGY
+    # ---------------------------
     st.header("3. The 3-Bucket Strategy Implementation")
     st.markdown(
         "Segment the portfolio into time-based buckets to manage **sequence-of-returns risk** "
@@ -1064,7 +1257,9 @@ with tab1:
 
     st.markdown("---")
 
-    # Stress test
+    # ---------------------------
+    # SECTION 4: STRESS TEST
+    # ---------------------------
     st.header("4. Stress Test: Capacity for Loss")
     st.markdown("Simulate an immediate market shock to understand downside resilience.")
 
@@ -1087,7 +1282,9 @@ with tab1:
 
     st.caption("This is a simple single-period stress test. In practice, you would combine this with scenario analysis and more detailed risk modeling.")
 
-    # Plan analysis & recommendations (kept as your existing logic)
+    # ---------------------------
+    # SECTION 5: PLAN ANALYSIS & RECOMMENDATIONS (same logic; uses df)
+    # ---------------------------
     st.markdown("---")
     st.header("5. Plan Analysis & Recommendations")
 
@@ -1275,7 +1472,6 @@ with tab1:
             st.markdown("#### Portfolio Risk Assessment")
             st.markdown(result["risk_assessment"])
 
-
 # =============================================================================
 # TAB 2: COMPARE SCENARIOS
 # =============================================================================
@@ -1283,32 +1479,30 @@ with tab2:
     st.subheader("Scenario Comparison (Side-by-Side)")
 
     scenarios = _get_scenarios()
-    if not scenarios:
-        st.info("No scenarios saved yet. Create one from the Single Scenario tab by using the button below.")
-    # Provide an always-available create button (even if no scenarios exist yet)
-    if st.button("Create Scenario from current sidebar", use_container_width=True, key="create_scenario_top"):
-        snap = normalize_snapshot(get_current_inputs_snapshot())
-        scenarios = _get_scenarios()
-        scenarios.append(
-            {
-                "id": str(uuid.uuid4())[:8],
-                "name": f"Scenario {len(scenarios) + 1}",
-                "inputs": copy.deepcopy(snap),
-                "results_df": None,
-                "kpis": None,
-            }
-        )
-        _set_scenarios(scenarios)
-        st.rerun()
 
-    scenarios = _get_scenarios()
+    # Always show Create, even when the user has no saved scenarios yet.
     if not scenarios:
+        if st.button("Create Scenario from current sidebar", use_container_width=True):
+            snap = normalize_snapshot(get_current_inputs_snapshot())
+            scenarios.append(
+                {
+                    "id": str(uuid.uuid4())[:8],
+                    "name": "Scenario 1",
+                    "inputs": copy.deepcopy(snap),
+                    "results_df": None,
+                    "kpis": None,
+                }
+            )
+            _set_scenarios(scenarios)
+            st.rerun()
+
+        st.info("No scenarios saved yet. Create your first scenario above, then you can edit, duplicate, and compare.")
         st.stop()
 
-    # Select scenario to edit (by ID, not name)
-    id_to_label = {sc["id"]: f'{sc["name"]} ({sc["id"]})' for sc in scenarios}
+    # --- Select scenario to edit (by ID, not name) ---
+    id_to_label = {sc["id"]: f"{sc['name']} ({sc['id']})" for sc in scenarios}
+    labels = [id_to_label[sc["id"]] for sc in scenarios]
     ids = [sc["id"] for sc in scenarios]
-    labels = [id_to_label[sid] for sid in ids]
 
     if "edit_scenario_id" not in st.session_state or st.session_state.edit_scenario_id not in ids:
         st.session_state.edit_scenario_id = ids[0]
@@ -1316,7 +1510,7 @@ with tab2:
     selected_label = st.selectbox(
         "Select a scenario to edit",
         options=labels,
-        index=labels.index(id_to_label[st.session_state.edit_scenario_id]),
+        index=ids.index(st.session_state.edit_scenario_id),
     )
     selected_id = ids[labels.index(selected_label)]
     st.session_state.edit_scenario_id = selected_id
@@ -1325,18 +1519,16 @@ with tab2:
     sc_idx = next(i for i, sc in enumerate(scenarios) if sc["id"] == selected_id)
     scenario = scenarios[sc_idx]
 
-    # Create / Delete row
-    c1, c2 = st.columns([1, 1])
+    # --- Create / Duplicate / Delete ---
+    c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        if st.button("Duplicate selected scenario", use_container_width=True):
-            scenarios = _get_scenarios()
-            sc_idx = next(i for i, sc in enumerate(scenarios) if sc["id"] == selected_id)
-            base = scenarios[sc_idx]
+        if st.button("Create Scenario from current sidebar", use_container_width=True):
+            snap = normalize_snapshot(get_current_inputs_snapshot())
             scenarios.append(
                 {
                     "id": str(uuid.uuid4())[:8],
-                    "name": f"{base['name']} (copy)",
-                    "inputs": copy.deepcopy(base["inputs"]),
+                    "name": f"Scenario {len(scenarios) + 1}",
+                    "inputs": copy.deepcopy(snap),
                     "results_df": None,
                     "kpis": None,
                 }
@@ -1345,6 +1537,21 @@ with tab2:
             st.rerun()
 
     with c2:
+        if st.button("Duplicate selected scenario", use_container_width=True):
+            src = scenarios[sc_idx]
+            scenarios.append(
+                {
+                    "id": str(uuid.uuid4())[:8],
+                    "name": f"{src['name']} (Copy)",
+                    "inputs": copy.deepcopy(normalize_snapshot(src.get("inputs", {}))),
+                    "results_df": None,
+                    "kpis": None,
+                }
+            )
+            _set_scenarios(scenarios)
+            st.rerun()
+
+    with c3:
         if st.button("Delete selected scenario", use_container_width=True):
             scenarios = [sc for sc in scenarios if sc["id"] != selected_id]
             _set_scenarios(scenarios)
@@ -1358,195 +1565,155 @@ with tab2:
     # =========================================================
     st.markdown(f"### Edit: {scenario['name']}")
 
-    # Working deep copy (avoid mutation)
-    working = normalize_snapshot(copy.deepcopy(scenario["inputs"]))
+    working = normalize_snapshot(scenario["inputs"])  # normalize + deep copy
     prefix = f"sc_{selected_id}_"
 
-    with st.form(f"edit_form_{selected_id}", clear_on_submit=False):
-        new_name = st.text_input("Scenario name", value=scenario["name"], key=prefix + "name")
+    # Name edit
+    new_name = st.text_input("Scenario name", value=scenario["name"], key=prefix + "name")
 
+    with st.form(f"edit_form_{selected_id}"):
         st.markdown("#### Demographics")
-        working["current_age"] = st.number_input("Current Age", 35, 90, int(working.get("current_age", 50)), key=prefix + "current_age")
-        working["retire_age"] = st.number_input("Retirement Age", 35, 90, int(working.get("retire_age", 60)), key=prefix + "retire_age")
-        working["life_expectancy"] = st.number_input("Life Expectancy", 70, 110, int(working.get("life_expectancy", 95)), key=prefix + "life_expectancy")
+        working["current_age"] = st.number_input("Current Age", 35, 90, int(working.get("current_age", 50)), key=prefix+"current_age")
+        working["retire_age"] = st.number_input("Retirement Age", 35, 90, int(working.get("retire_age", 60)), key=prefix+"retire_age")
+        working["life_expectancy"] = st.number_input("Life Expectancy", 70, 110, int(working.get("life_expectancy", 95)), key=prefix+"life_expectancy")
 
         st.markdown("#### Spending & Savings")
         working["annual_spend_retirement"] = st.number_input(
             "Annual spend in retirement (today $)",
             value=float(working.get("annual_spend_retirement", 155000)),
-            key=prefix + "spend",
+            key=prefix+"spend",
         )
         working["annual_contribution"] = st.number_input(
             "Annual contribution until retirement ($)",
             value=float(working.get("annual_contribution", 65000)),
-            key=prefix + "contrib",
+            key=prefix+"contrib",
         )
 
         st.markdown("#### Assumptions (Percent)")
-        infl_pct = st.slider("Inflation (%)", 1.0, 5.0, _as_percent_display(working.get("inflation_rate", 0.03), 3.0), 0.1, key=prefix + "infl_pct")
-        pre_pct = st.slider("Pre-retirement return (%)", 1.0, 12.0, _as_percent_display(working.get("pre_retire_return", 0.07), 7.0), 0.1, key=prefix + "pre_pct")
-        post_pct = st.slider("Post-retirement return (%)", 1.0, 10.0, _as_percent_display(working.get("post_retire_return", 0.045), 4.5), 0.1, key=prefix + "post_pct")
+        infl_pct = st.slider("Inflation (%)", 1.0, 5.0, _as_percent_display(working.get("inflation_rate", 0.03), 3.0), 0.1, key=prefix+"infl_pct")
+        pre_pct  = st.slider("Pre-retirement return (%)", 1.0, 12.0, _as_percent_display(working.get("pre_retire_return", 0.07), 7.0), 0.1, key=prefix+"pre_pct")
+        post_pct = st.slider("Post-retirement return (%)", 1.0, 10.0, _as_percent_display(working.get("post_retire_return", 0.045), 4.5), 0.1, key=prefix+"post_pct")
 
         working["inflation_rate"] = infl_pct / 100.0
         working["pre_retire_return"] = pre_pct / 100.0
         working["post_retire_return"] = post_pct / 100.0
 
         st.markdown("#### Guaranteed Income")
-        working["social_security"] = st.number_input("Social Security / Pension (annual $)", value=float(working.get("social_security", 30000)), key=prefix + "ss")
-        working["ss_start_age"] = st.number_input("SS / Pension start age", 60, 75, int(working.get("ss_start_age", 67)), key=prefix + "ss_age")
+        working["social_security"] = st.number_input("Social Security / Pension (annual $)", value=float(working.get("social_security", 30000)), key=prefix+"ss")
+        working["ss_start_age"] = st.number_input("SS / Pension start age", 60, 75, int(working.get("ss_start_age", 67)), key=prefix+"ss_age")
 
         st.markdown("#### Portfolio")
-        working["use_multi_asset"] = st.checkbox("Use Multi-Asset (Cash/Bonds/ETFs/401k)", value=bool(working.get("use_multi_asset", True)), key=prefix + "multi")
-        working["flow_mode"] = st.selectbox(
-            "Withdrawal mode",
-            ["cash_first", "pro_rata"],
-            index=0 if working.get("flow_mode", "cash_first") == "cash_first" else 1,
-            key=prefix + "flow",
-        )
+        working["use_multi_asset"] = st.checkbox("Use Multi-Asset (Cash/Bonds/ETFs/401k)", value=bool(working.get("use_multi_asset", True)), key=prefix+"multi")
+        working["flow_mode"] = st.selectbox("Withdrawal mode", ["cash_first", "pro_rata"], index=0 if working.get("flow_mode","cash_first")=="cash_first" else 1, key=prefix+"flow")
 
         if working["use_multi_asset"]:
             st.markdown("##### Multi-Asset Inputs")
-            working["cash_bal"] = st.number_input("Cash balance ($)", value=float(working.get("cash_bal", 200000)), key=prefix + "cash_bal")
-            cy = st.slider("Cash yield (%)", 0.0, 8.0, _as_percent_display(working.get("cash_yield", 0.04), 4.0), 0.1, key=prefix + "cash_y")
+            working["cash_bal"] = st.number_input("Cash balance ($)", value=float(working.get("cash_bal", 200000)), key=prefix+"cash_bal")
+            cy = st.slider("Cash yield (%)", 0.0, 8.0, _as_percent_display(working.get("cash_yield", 0.04), 4.0), 0.1, key=prefix+"cash_y")
             working["cash_yield"] = cy / 100.0
 
-            working["bonds_bal"] = st.number_input("Bonds/Munis balance ($)", value=float(working.get("bonds_bal", 400000)), key=prefix + "bonds_bal")
-            by = st.slider("Bonds yield (%)", 0.0, 10.0, _as_percent_display(working.get("bonds_yield", 0.05), 5.0), 0.1, key=prefix + "bonds_y")
+            working["bonds_bal"] = st.number_input("Bonds/Munis balance ($)", value=float(working.get("bonds_bal", 400000)), key=prefix+"bonds_bal")
+            by = st.slider("Bonds yield (%)", 0.0, 10.0, _as_percent_display(working.get("bonds_yield", 0.05), 5.0), 0.1, key=prefix+"bonds_y")
             working["bonds_yield"] = by / 100.0
 
-            working["etfs_bal"] = st.number_input("ETFs balance ($)", value=float(working.get("etfs_bal", 439000)), key=prefix + "etfs_bal")
-            ey = st.slider("ETFs return (%)", 0.0, 12.0, _as_percent_display(working.get("etfs_yield", 0.07), 7.0), 0.1, key=prefix + "etfs_y")
+            working["etfs_bal"] = st.number_input("ETFs balance ($)", value=float(working.get("etfs_bal", 439000)), key=prefix+"etfs_bal")
+            ey = st.slider("ETFs return (%)", 0.0, 12.0, _as_percent_display(working.get("etfs_yield", 0.07), 7.0), 0.1, key=prefix+"etfs_y")
             working["etfs_yield"] = ey / 100.0
 
-            working["k401_bal"] = st.number_input("401k balance ($)", value=float(working.get("k401_bal", 200000)), key=prefix + "k401_bal")
-            ky = st.slider("401k return (%)", 0.0, 12.0, _as_percent_display(working.get("k401_yield", 0.07), 7.0), 0.1, key=prefix + "k401_y")
+            working["k401_bal"] = st.number_input("401k balance ($)", value=float(working.get("k401_bal", 200000)), key=prefix+"k401_bal")
+            ky = st.slider("401k return (%)", 0.0, 12.0, _as_percent_display(working.get("k401_yield", 0.07), 7.0), 0.1, key=prefix+"k401_y")
             working["k401_yield"] = ky / 100.0
         else:
-            working["current_portfolio"] = st.number_input("Total invested assets ($)", value=float(working.get("current_portfolio", 1239000)), key=prefix + "total")
+            working["current_portfolio"] = st.number_input("Total invested assets ($)", value=float(working.get("current_portfolio", 1239000)), key=prefix+"total")
 
         save_clicked = st.form_submit_button("Save Scenario")
 
     if save_clicked:
-        scenarios = _get_scenarios()
+        scenarios = _get_scenarios()  # reload
         sc_idx = next(i for i, sc in enumerate(scenarios) if sc["id"] == selected_id)
-
         scenarios[sc_idx]["name"] = new_name
-        scenarios[sc_idx]["inputs"] = normalize_snapshot(copy.deepcopy(working))
-
-        # Clear cached outputs so Compare tab re-runs cleanly
+        scenarios[sc_idx]["inputs"] = normalize_snapshot(working)  # normalized + deep copy
         scenarios[sc_idx]["results_df"] = None
         scenarios[sc_idx]["kpis"] = None
-
         _set_scenarios(scenarios)
-
         st.success("Scenario saved.")
-        st.rerun()
 
     st.markdown("---")
+
     # =========================================================
-    # RUN COMPARISON (recompute from saved inputs; no stale caching)
+    # RUN COMPARISON (SELECT BY ID; NOT NAME)
     # =========================================================
     scenarios = _get_scenarios()
-
     compare_ids = st.multiselect(
         "Select scenarios to compare",
         options=[sc["id"] for sc in scenarios],
-        default=[sc["id"] for sc in scenarios[:3]] if len(scenarios) >= 3 else [sc["id"] for sc in scenarios[:2]],
+        default=[sc["id"] for sc in scenarios[:2]],
         format_func=lambda sid: id_to_label.get(sid, sid),
     )
 
-    # Store results in session_state so users can edit scenarios without losing the last comparison
-    if "compare_results" not in st.session_state:
-        st.session_state.compare_results = {}
-
-    def _snapshot_fingerprint(snap: dict) -> str:
-        # Stable hash to detect input changes
-        try:
-            payload = json.dumps(snap, sort_keys=True, default=str)
-        except Exception:
-            payload = repr(sorted(snap.items()))
-        return hashlib.md5(payload.encode("utf-8")).hexdigest()
-
-    run_clicked = st.button("Run Comparison", type="primary")
-
-    if run_clicked:
-        results = {}
-        for sc in scenarios:
+    if st.button("Run Comparison", type="primary"):
+        for i, sc in enumerate(scenarios):
             if sc["id"] not in compare_ids:
                 continue
 
-            snap = normalize_snapshot(copy.deepcopy(sc["inputs"]))
-            df_sc = run_projection_from_snapshot(snap)
+            snap = normalize_snapshot(sc["inputs"])
+            df_sc = run_projection_from_snapshot(snap)  # must accept snapshot with decimal rates
             kpis = scenario_kpis(
                 df_sc,
-                retire_age=int(snap["retire_age"]),
-                current_age=int(snap["current_age"]),
-                life_expectancy=int(snap["life_expectancy"]),
+                retire_age=snap["retire_age"],
+                current_age=snap["current_age"],
+                life_expectancy=snap["life_expectancy"],
             )
 
-            results[sc["id"]] = {
-                "name": sc["name"],
-                "fingerprint": _snapshot_fingerprint(snap),
-                "inputs": snap,
-                "df": df_sc,
-                "kpis": kpis,
-            }
+            scenarios[i]["results_df"] = df_sc
+            scenarios[i]["kpis"] = kpis
 
-        st.session_state.compare_results = results
+        _set_scenarios(scenarios)
         st.success("Comparison updated.")
 
-    # Display: always compute fresh if inputs changed since last run
-    chosen = [sc for sc in scenarios if sc["id"] in compare_ids]
+    # Display
+    chosen = [sc for sc in _get_scenarios() if sc["id"] in compare_ids and sc.get("kpis") is not None]
     if not chosen:
-        st.info("Select one or more scenarios to compare.")
+        st.info("Select scenarios and click Run Comparison.")
         st.stop()
 
-    display_rows = []
-    series = []
-
+    rows = []
     for sc in chosen:
-        sid = sc["id"]
-        snap = normalize_snapshot(copy.deepcopy(sc["inputs"]))
-        fp = _snapshot_fingerprint(snap)
+        row = {"Scenario": sc["name"]}
+        row.update(sc["kpis"])
+        rows.append(row)
 
-        cached = st.session_state.compare_results.get(sid)
-        if cached is None or cached.get("fingerprint") != fp:
-            # Compute on the fly so results always match the saved scenario inputs
-            df_sc = run_projection_from_snapshot(snap)
-            kpis = scenario_kpis(
-                df_sc,
-                retire_age=int(snap["retire_age"]),
-                current_age=int(snap["current_age"]),
-                life_expectancy=int(snap["life_expectancy"]),
-            )
-            cached = {"name": sc["name"], "df": df_sc, "kpis": kpis, "fingerprint": fp}
-            st.session_state.compare_results[sid] = cached
+    kpi_df = pd.DataFrame(rows)
+    # ---- Pretty formatting (currency to 1 decimal; percentages to 2 decimals) ----
+    def _fmt_cur(x):
+        try:
+            return f"${float(x):,.1f}"
+        except Exception:
+            return ""
+    def _fmt_int(x):
+        try:
+            xi = int(float(x))
+            return str(xi)
+        except Exception:
+            return ""
 
-        row = {"Scenario": cached["name"]}
-        row.update(cached["kpis"])
-        display_rows.append(row)
-        series.append((cached["name"], cached["df"]))
+    for c in ["Assets @ Retire", "Final Balance"]:
+        if c in kpi_df.columns:
+            kpi_df[c] = kpi_df[c].map(_fmt_cur)
 
-    kpi_df = pd.DataFrame(display_rows)
-
-    # ---- Formatting (1 decimal for $; % for rates) ----
-    money_cols = [c for c in ["Assets @ Retire", "Final Balance"] if c in kpi_df.columns]
-    for c in money_cols:
-        kpi_df[c] = kpi_df[c].astype(float).map(lambda x: f"${x:,.1f}")
+    if "Depletion Age" in kpi_df.columns:
+        kpi_df["Depletion Age"] = kpi_df["Depletion Age"].map(_fmt_int)
 
     if "Withdrawal Rate (1st yr)" in kpi_df.columns:
         kpi_df["Withdrawal Rate (1st yr)"] = kpi_df["Withdrawal Rate (1st yr)"].astype(float).map(lambda x: f"{x*100:.2f}%")
-
-    # Depletion Age: show blank if sustainable, else the age
-    if "Depletion Age" in kpi_df.columns:
-        kpi_df["Depletion Age"] = kpi_df["Depletion Age"].replace({None: "", np.nan: ""})
-
     st.dataframe(kpi_df, use_container_width=True, hide_index=True)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    for name, df_sc in series:
-        ax.plot(df_sc["Age"], df_sc["End Balance"], linewidth=2, label=name)
+    for sc in chosen:
+        df_sc = sc["results_df"]
+        ax.plot(df_sc["Age"], df_sc["End Balance"], linewidth=2, label=sc["name"])
     ax.set_xlabel("Age")
     ax.set_ylabel("Total Portfolio ($)")
     ax.legend(loc="upper right")
     st.pyplot(fig)
+
