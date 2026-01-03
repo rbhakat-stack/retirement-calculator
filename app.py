@@ -272,22 +272,40 @@ def sb_load_user_state(user_id: str) -> dict:
     return {}
 
 
-def sb_upsert_user_state_row(user_id, working_inputs=None, active_scenario_id=None):
-    """Upsert into the public.user_state table (user_id PK)."""
+def sb_upsert_user_state_row(user_id: str, active_scenario_id=None, working_inputs=None):
+    """
+    Persist lightweight per-user UI state into the `user_state` table:
+      - active_scenario_id (uuid, nullable)
+      - working_inputs (jsonb, nullable)
+
+    Important:
+    - We only write active_scenario_id if it is a valid UUID. This avoids insert/update failures
+      when the app is using short, non-UUID scenario ids in-session.
+    - We do NOT send active_scenario_id=None, to avoid accidentally wiping a previously stored UUID.
+    """
+    if not SUPABASE_ENABLED:
+        return
+
+    client = get_supabase_client()
+
+    payload = {
+        "user_id": user_id,
+        "working_inputs": working_inputs,
+        "updated_at": "now()",
+    }
+
+    # Only include active_scenario_id if it is a valid UUID string/object
+    if active_scenario_id:
+        try:
+            payload["active_scenario_id"] = str(uuid.UUID(str(active_scenario_id)))
+        except Exception:
+            # invalid UUID; skip writing this field
+            pass
+
     try:
-        client = get_supabase_client()
-        payload = {
-            "user_id": user_id,
-            "active_scenario_id": active_scenario_id,
-            "working_inputs": working_inputs,
-            "updated_at": _sb_now_iso(),
-        }
-        res = client.table("user_state").upsert(payload, on_conflict="user_id").execute()
-        _sb_debug_log(f"user_state upsert ok for {user_id} (status={getattr(res, 'status_code', 'n/a')})")
-        return True
+        client.table("user_state").upsert(payload, on_conflict="user_id").execute()
     except Exception as e:
-        _sb_debug_log(f"ERROR: user_state upsert failed for {user_id}: {e}")
-        return False
+        _sb_debug_log(f"WARNING: user_state upsert failed (non-fatal): {e}")
 
 def sb_save_user_state(user_id: str, working_inputs: dict | None, active_scenario_id: str | None = None) -> bool:
     """Upsert per-user working inputs into Supabase.
