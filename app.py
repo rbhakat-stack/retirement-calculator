@@ -8,6 +8,87 @@ import copy
 import uuid
 
 # -----------------------------------------------------------------------------
+# GLOBAL HELPERS (needed early for Supabase loaders)
+# -----------------------------------------------------------------------------
+SB_DEBUG_DEFAULT = False  # user requested debug panel OFF by default
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        v = lo
+    return max(lo, min(hi, v))
+
+def _sb_debug_log(msg: str) -> None:
+    """Lightweight logger; does not render UI unless you explicitly enable it."""
+    try:
+        logs = st.session_state.setdefault("_sb_debug_msgs", [])
+        logs.append(str(msg))
+        # Avoid unbounded growth
+        if len(logs) > 200:
+            st.session_state["_sb_debug_msgs"] = logs[-200:]
+    except Exception:
+        pass
+
+def _as_decimal_rate(x, default=0.0):
+    """Normalize any rate to decimal form (0.07 or 7 -> 0.07)."""
+    try:
+        v = float(x)
+    except Exception:
+        return float(default)
+    return v / 100.0 if v > 1.0 else v
+
+def _as_percent_display(x, default_pct=0.0):
+    """For slider defaults (percent units). Returns number like 7.0."""
+    d = _as_decimal_rate(x, default=default_pct / 100.0)
+    return d * 100.0
+
+def normalize_snapshot(s: dict) -> dict:
+    """Return a NEW snapshot with consistent units (rates as decimals)."""
+    s2 = copy.deepcopy(s or {})
+
+    # Core rates
+    s2["inflation_rate"] = _as_decimal_rate(s2.get("inflation_rate", 0.03), 0.03)
+    s2["pre_retire_return"] = _as_decimal_rate(s2.get("pre_retire_return", 0.07), 0.07)
+    s2["post_retire_return"] = _as_decimal_rate(s2.get("post_retire_return", 0.045), 0.045)
+
+    # Multi-asset yields
+    s2["cash_yield"] = _as_decimal_rate(s2.get("cash_yield", 0.04), 0.04)
+    s2["bonds_yield"] = _as_decimal_rate(s2.get("bonds_yield", 0.05), 0.05)
+    s2["etfs_yield"] = _as_decimal_rate(s2.get("etfs_yield", 0.07), 0.07)
+    s2["k401_yield"] = _as_decimal_rate(s2.get("k401_yield", 0.07), 0.07)
+
+    # Defaults / required keys
+    s2["use_multi_asset"] = bool(s2.get("use_multi_asset", True))
+    s2["flow_mode"] = s2.get("flow_mode", "cash_first")
+    if s2["flow_mode"] not in ("cash_first", "pro_rata"):
+        s2["flow_mode"] = "cash_first"
+
+    # Ensure numeric types for critical fields
+    for k in ["current_age", "retire_age", "life_expectancy", "ss_start_age"]:
+        if k in s2 and s2[k] is not None:
+            try:
+                s2[k] = int(s2[k])
+            except Exception:
+                pass
+
+    for k in [
+        "annual_spend_retirement", "social_security", "annual_contribution",
+        "current_portfolio", "cash_bal", "bonds_bal", "etfs_bal", "k401_bal"
+    ]:
+        if k in s2 and s2[k] is not None:
+            try:
+                s2[k] = float(s2[k])
+            except Exception:
+                pass
+
+    return s2
+
+def _sb_scenarios_table() -> str:
+    return st.secrets.get("supabase", {}).get("scenarios_table", "scenarios")
+from datetime import datetime, timezone
+
+# -----------------------------------------------------------------------------
 # RATE NORMALIZATION HELPERS (prevents percent/decimal confusion)
 # -----------------------------------------------------------------------------
 def _as_decimal_rate(x, default=0.0):
@@ -54,12 +135,46 @@ def _get_supabase_client():
         return None
 
 
+
+# Backwards-compatible alias (some code paths call get_supabase_client)
+def get_supabase_client():
+    return _get_supabase_client()
+
 def _sb_enabled() -> bool:
     return _get_supabase_client() is not None
 
 
+def _sb_debug_log(msg: str):
+    """
+    Append a message to an in-memory debug log (only when debug_supabase is enabled).
+    This is intentionally safe/no-op in production runs.
+    """
+    try:
+        if not st.session_state.get("debug_supabase", False):
+            return
+        logs = st.session_state.setdefault("_sb_debug_logs", [])
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logs.append(f"{ts} | {msg}")
+        # keep log bounded
+        if len(logs) > 500:
+            del logs[:-500]
+    except Exception:
+        # Never break the app due to debug logging
+        return
+
 def _sb_table() -> str:
-    return st.secrets.get("supabase", {}).get("table", "retirement_user_state")
+    """Name of the table that stores per-user state.
+
+    Priority:
+      1) st.secrets.supabase.user_state_table (explicit)
+      2) fallback to 'retirement_user_state' (your current deployment)
+      3) final fallback to 'user_state' (older naming)
+    """
+    tbl = st.secrets.get("supabase", {}).get("user_state_table")
+    if tbl:
+        return tbl
+    # Default to the newer name you created, but keep backward compatibility.
+    return "retirement_user_state"
 
 
 def _scenario_store_key() -> str:
@@ -93,43 +208,240 @@ def _sb_json_sanitize(x):
     return x
 
 
-def sb_load_user_state(user_id: str) -> dict | None:
-    """Return {'scenarios': [...], 'single_snapshot': {...}} or None."""
-    sb = _get_supabase_client()
-    if sb is None:
-        return None
-    table = _sb_table()
+def sb_load_user_state(user_id: str) -> dict:
+    """Load per-user working inputs (Single Scenario sidebar state) from Supabase.
+
+    Preferred schema (per your SQL):
+      user_state(user_id text PK, active_scenario_id uuid NULL, working_inputs jsonb NULL, updated_at timestamptz)
+
+    Also tolerates legacy tables that stored 'single_snapshot' instead of 'working_inputs'.
+    """
     try:
-        resp = sb.table(table).select("user_id,scenarios,single_snapshot").eq("user_id", user_id).execute()
-        data = getattr(resp, "data", None) or []
-        if not data:
-            return None
-        row = data[0] if isinstance(data, list) else data
-        return {
-            "scenarios": row.get("scenarios") or [],
-            "single_snapshot": row.get("single_snapshot") or {},
+        client = get_supabase_client()
+    except Exception as e:
+        _sb_debug_log(f"ERROR: get_supabase_client failed in sb_load_user_state: {e}")
+        return {}
+
+    table_from_secrets = (st.secrets.get("supabase", {}) or {}).get("user_state_table") or ""
+    candidates = [t for t in [table_from_secrets, "user_state", "retirement_user_state"] if t]
+
+    for table in candidates:
+        # First: try modern schema
+        try:
+            res = (
+                client.table(table)
+                .select("user_id, active_scenario_id, working_inputs, updated_at")
+                .eq("user_id", user_id)
+                .maybe_single()
+                .execute()
+            )
+            row = getattr(res, "data", None) or {}
+            if row and row.get("working_inputs") is not None:
+                return {
+                    "_table": table,
+                    "user_id": row.get("user_id", user_id),
+                    "active_scenario_id": row.get("active_scenario_id"),
+                    "working_inputs": row.get("working_inputs"),
+                    "updated_at": row.get("updated_at"),
+                }
+        except Exception as e:
+            _sb_debug_log(f"WARN: sb_load_user_state modern select failed on '{table}': {e}")
+
+        # Second: legacy schema
+        try:
+            res = (
+                client.table(table)
+                .select("user_id, single_snapshot, updated_at")
+                .eq("user_id", user_id)
+                .maybe_single()
+                .execute()
+            )
+            row = getattr(res, "data", None) or {}
+            if row and row.get("single_snapshot") is not None:
+                return {
+                    "_table": table,
+                    "user_id": row.get("user_id", user_id),
+                    "active_scenario_id": None,
+                    "working_inputs": row.get("single_snapshot"),
+                    "updated_at": row.get("updated_at"),
+                }
+        except Exception as e:
+            _sb_debug_log(f"WARN: sb_load_user_state legacy select failed on '{table}': {e}")
+            continue
+
+    return {}
+
+
+def sb_upsert_user_state_row(user_id, working_inputs=None, active_scenario_id=None):
+    """Upsert into the public.user_state table (user_id PK)."""
+    try:
+        client = get_supabase_client()
+        payload = {
+            "user_id": user_id,
+            "active_scenario_id": active_scenario_id,
+            "working_inputs": working_inputs,
+            "updated_at": _sb_now_iso(),
         }
-    except Exception:
-        return None
-
-
-def sb_save_user_state(user_id: str, scenarios: list, single_snapshot: dict | None = None) -> bool:
-    """Upsert user state. Safe no-op if Supabase not configured."""
-    sb = _get_supabase_client()
-    if sb is None:
-        return False
-    table = _sb_table()
-    payload = {
-        "user_id": str(user_id),
-        "scenarios": _sb_json_sanitize(scenarios),
-    }
-    if single_snapshot is not None:
-        payload["single_snapshot"] = _sb_json_sanitize(single_snapshot)
-
-    # Some schemas use 'single_inputs' instead of 'single_snapshot'. Attempt both.
-    try:
-        sb.table(table).upsert(payload, on_conflict="user_id").execute()
+        res = client.table("user_state").upsert(payload, on_conflict="user_id").execute()
+        _sb_debug_log(f"user_state upsert ok for {user_id} (status={getattr(res, 'status_code', 'n/a')})")
         return True
+    except Exception as e:
+        _sb_debug_log(f"ERROR: user_state upsert failed for {user_id}: {e}")
+        return False
+
+def sb_save_user_state(user_id: str, working_inputs: dict | None, active_scenario_id: str | None = None) -> bool:
+    """Upsert per-user working inputs into Supabase.
+
+    Writes into the first table that matches your schema (user_state or the configured table).
+    """
+    try:
+        client = get_supabase_client()
+    except Exception as e:
+        _sb_debug_log(f"ERROR: get_supabase_client failed in sb_save_user_state: {e}")
+        return False
+
+    table_from_secrets = (st.secrets.get("supabase", {}) or {}).get("user_state_table") or ""
+    candidates = [t for t in [table_from_secrets, "user_state", "retirement_user_state"] if t]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for table in candidates:
+        # Prefer modern schema (working_inputs)
+        try:
+            payload = {
+                "user_id": user_id,
+                "active_scenario_id": active_scenario_id,
+                "working_inputs": working_inputs,
+                "updated_at": now_iso,
+            }
+            client.table(table).upsert(payload, on_conflict="user_id").execute()
+            _sb_debug_log(f"OK: sb_save_user_state upserted into '{table}'")
+            sb_upsert_user_state_row(user_id=user_id, working_inputs=working_inputs, active_scenario_id=None)
+            return True
+        except Exception as e1:
+            _sb_debug_log(f"WARN: sb_save_user_state failed on '{table}' (working_inputs): {e1}")
+            # Try legacy schema with single_snapshot
+            try:
+                legacy_payload = {"user_id": user_id, "single_snapshot": working_inputs, "updated_at": now_iso}
+                client.table(table).upsert(legacy_payload, on_conflict="user_id").execute()
+                _sb_debug_log(f"OK: sb_save_user_state upserted legacy into '{table}'")
+                sb_upsert_user_state_row(user_id=user_id, working_inputs=working_inputs, active_scenario_id=None)
+                return True
+            except Exception as e2:
+                _sb_debug_log(f"WARN: sb_save_user_state failed on '{table}' (legacy): {e2}")
+                continue
+
+    return False
+
+def sb_list_scenarios(user_id: str) -> list[dict]:
+    """Load all saved scenarios for a user from Supabase (scenarios table)."""
+    client = get_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        resp = (
+            client.table(_sb_scenarios_table())
+            .select("id,name,inputs,updated_at,created_at")
+            .eq("user_id", user_id)
+            .order("updated_at", desc=True)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_list_scenarios failed: {e}")
+        return []
+
+    scenarios: list[dict] = []
+    for r in rows:
+        scenarios.append(
+            {
+                "id": str(r.get("id")),
+                "name": r.get("name", "Scenario"),
+                "inputs": normalize_snapshot(r.get("inputs") or {}),
+                "results_df": None,
+                "kpis": None,
+            }
+        )
+    return scenarios
+
+
+def sb_upsert_scenario(user_id: str, scenario: dict) -> bool:
+    """Upsert a single scenario row."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+
+    # Ensure UUID id
+    sid = str(scenario.get("id") or uuid.uuid4())
+    try:
+        uuid.UUID(sid)
+    except Exception:
+        sid = str(uuid.uuid4())
+
+    payload = {
+        "id": sid,
+        "user_id": user_id,
+        "name": str(scenario.get("name") or "Scenario"),
+        "inputs": normalize_snapshot(scenario.get("inputs") or {}),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        client.table(_sb_scenarios_table()).upsert(payload).execute()
+        return True
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_upsert_scenario failed: {e}")
+        return False
+
+
+def sb_delete_scenario(user_id: str, scenario_id: str) -> bool:
+    client = get_supabase_client()
+    if client is None:
+        return False
+    try:
+        client.table(_sb_scenarios_table()).delete().eq("user_id", user_id).eq("id", scenario_id).execute()
+        return True
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_delete_scenario failed: {e}")
+        return False
+
+
+def sb_sync_scenarios(user_id: str, scenarios: list[dict]) -> None:
+    """Persist the entire scenario list (upsert all; delete removed)."""
+    client = get_supabase_client()
+    if client is None:
+        return
+
+    # Upsert all current scenarios
+    current_ids: set[str] = set()
+    for sc in scenarios:
+        # Ensure uuid IDs; if not, replace in-memory as well so app stays consistent.
+        sid = str(sc.get("id") or uuid.uuid4())
+        try:
+            uuid.UUID(sid)
+        except Exception:
+            sid = str(uuid.uuid4())
+            sc["id"] = sid
+
+        ok = sb_upsert_scenario(user_id, sc)
+        if ok:
+            current_ids.add(sid)
+
+    # Delete removed scenarios (best-effort)
+    try:
+        resp = (
+            client.table(_sb_scenarios_table())
+            .select("id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        existing = {str(r.get("id")) for r in (getattr(resp, "data", None) or [])}
+        to_delete = list(existing - current_ids)
+        for sid in to_delete:
+            sb_delete_scenario(user_id, sid)
+    except Exception as e:
+        _sb_debug_log(f"WARN: sb_sync_scenarios delete-sweep failed: {e}")
+
     except Exception:
         if single_snapshot is None:
             return False
@@ -146,46 +458,23 @@ def sb_save_user_state(user_id: str, scenarios: list, single_snapshot: dict | No
 
 
 def _ensure_user_state_loaded():
-    """Load saved state (single inputs + scenarios) from Supabase into session_state once per login.
+    """Load per-user state once per login (single-scenario working inputs + saved compare scenarios)."""
+    user = st.session_state.get("current_user") or "default"
 
-    Critical detail: several sidebar widgets store *percent* values in st.session_state
-    (because they are created as sliders in % units). In Supabase we store rates as *decimals*.
-    Therefore, when restoring into st.session_state we must convert decimals -> percent
-    for those widget keys, otherwise Streamlit will ignore/reset out-of-range defaults.
-    """
-    user = st.session_state.get("current_user")
-    if not user:
+    if st.session_state.get("_sb_state_loaded") and st.session_state.get("_sb_loaded_user") == user:
         return
 
-    already_loaded = st.session_state.get("_sb_state_loaded", False) and st.session_state.get("_sb_loaded_user") == user
-    if already_loaded:
-        return
+    # 1) Load compare scenarios from Supabase scenarios table
+    _sc_loaded = sb_list_scenarios(user)
+    # Store into both the global key (legacy) and the per-user scenario store key used by Compare tab
+    st.session_state["scenarios"] = copy.deepcopy(_sc_loaded)
+    st.session_state[_scenario_store_key()] = copy.deepcopy(_sc_loaded)
 
-        st.session_state["_sb_state_loaded"] = True
-        return
+    # 2) Load single-scenario working inputs from the existing per-user table (retirement_user_state)
+    user_state = sb_load_user_state(user) or {}
+    single = user_state.get("working_inputs") or user_state.get("single_snapshot") or {}
 
-    saved = sb_load_user_state(user)
-    if not saved:
-        st.session_state["_sb_state_loaded"] = True
-        return
-
-    # 1) Restore scenarios list (used by Compare tab)
-    scenarios = saved.get("scenarios") or []
-    if isinstance(scenarios, list):
-        st.session_state["scenarios"] = copy.deepcopy(scenarios)
-
-    # 2) Restore Single Scenario inputs into the widget keys (used by sidebar)
-    single = saved.get("single_snapshot") or {}
-    if isinstance(single, dict) and single:
-        # Helper: clamp percent defaults to widget ranges to avoid Streamlit resetting them.
-        def _clamp(v, lo, hi):
-            try:
-                v = float(v)
-            except Exception:
-                return lo
-            return max(lo, min(hi, v))
-
-        # Keys that are sliders in the sidebar (percent units in session_state)
+    if single:
         percent_widget_keys = {
             "inflation_rate": (1.0, 5.0),
             "pre_retire_return": (1.0, 12.0),
@@ -211,34 +500,22 @@ def _ensure_user_state_loaded():
 
 
 def _maybe_persist_single_snapshot(snapshot: dict):
-    """Persist the current single-scenario inputs for the logged-in user."""
+    """Persist the current Single Scenario inputs for the logged-in user.
+
+    This is intentionally best-effort: persistence failures should never break the UI.
+    """
     user = st.session_state.get("current_user")
     if not user:
         return
     try:
-        # Keep rates normalized in storage
         snap = normalize_snapshot(snapshot)
-        # Save current scenarios too (so a user always restores a coherent set)
-        scenarios = copy.deepcopy(st.session_state.get("scenarios", []))
-        sb_save_user_state(user, single_snapshot=snap, scenarios=scenarios)
+        sb_save_user_state(
+            user,
+            working_inputs=snap,
+            active_scenario_id=st.session_state.get("edit_scenario_id"),
+        )
     except Exception:
-        # Do not break the app if persistence fails
         return
-
-
-# -----------------------------------------------------------------------------
-# APP CONFIGURATION
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Strategic Retirement Planner",
-    page_icon="💼",
-    layout="centered",
-    initial_sidebar_state="expanded",
-)
-
-# -----------------------------------------------------------------------------
-# SIMPLE LOGIN GATE (USERID/PASSWORD)
-# -----------------------------------------------------------------------------
 def _hash_password(password: str, salt: str) -> str:
     """
     PBKDF2 hash (basic gating). Store only the hash in st.secrets.
@@ -295,10 +572,17 @@ require_login()
 _ensure_user_state_loaded()
 
 with st.sidebar:
+    _u = st.session_state.get("current_user") or ""
+    if _u:
+        st.markdown(f"**Welcome {_u}**")
     if st.button("Log out"):
         st.session_state.is_authenticated = False
         st.session_state.current_user = None
-        # Force a fresh load from Supabase on next login
+        # Clear per-user cached state so the next login reloads cleanly
+        try:
+            st.session_state.pop(_scenario_store_key(), None)
+        except Exception:
+            pass
         st.session_state["_sb_state_loaded"] = False
         st.session_state["_sb_loaded_user"] = None
         st.rerun()
@@ -686,14 +970,14 @@ def _set_scenarios(scenarios):
     # Always store a deep copy for safety
     st.session_state[_scenario_store_key()] = copy.deepcopy(scenarios)
 
-    # Best-effort persistence (does nothing if Supabase is not configured)
-    user = st.session_state.get("current_user") or "default"
+    # Persist compare scenarios to Supabase (per-user) - best effort
+    user = st.session_state.get("current_user")
+    if not user:
+        return
     try:
-        sb_save_user_state(user, st.session_state[_scenario_store_key()], single_snapshot=st.session_state.get(_single_snapshot_key()))
+        sb_sync_scenarios(user, st.session_state[_scenario_store_key()])
     except Exception:
-        pass
-
-
+        return
 def get_current_inputs_snapshot() -> dict:
     """
     Snapshot current widgets via session_state keys.
@@ -1486,7 +1770,7 @@ with tab2:
             snap = normalize_snapshot(get_current_inputs_snapshot())
             scenarios.append(
                 {
-                    "id": str(uuid.uuid4())[:8],
+                    "id": str(uuid.uuid4()),
                     "name": "Scenario 1",
                     "inputs": copy.deepcopy(snap),
                     "results_df": None,
@@ -1515,6 +1799,13 @@ with tab2:
     selected_id = ids[labels.index(selected_label)]
     st.session_state.edit_scenario_id = selected_id
 
+    # Persist last-selected scenario for this user (helps restore Compare tab on next login)
+    try:
+        sb_save_user_state(st.session_state.get("current_user"), active_scenario_id=str(selected_id))
+    except Exception:
+        pass
+
+
     # Locate scenario
     sc_idx = next(i for i, sc in enumerate(scenarios) if sc["id"] == selected_id)
     scenario = scenarios[sc_idx]
@@ -1526,7 +1817,7 @@ with tab2:
             snap = normalize_snapshot(get_current_inputs_snapshot())
             scenarios.append(
                 {
-                    "id": str(uuid.uuid4())[:8],
+                    "id": str(uuid.uuid4()),
                     "name": f"Scenario {len(scenarios) + 1}",
                     "inputs": copy.deepcopy(snap),
                     "results_df": None,
@@ -1541,7 +1832,7 @@ with tab2:
             src = scenarios[sc_idx]
             scenarios.append(
                 {
-                    "id": str(uuid.uuid4())[:8],
+                    "id": str(uuid.uuid4()),
                     "name": f"{src['name']} (Copy)",
                     "inputs": copy.deepcopy(normalize_snapshot(src.get("inputs", {}))),
                     "results_df": None,
@@ -1716,4 +2007,3 @@ with tab2:
     ax.set_ylabel("Total Portfolio ($)")
     ax.legend(loc="upper right")
     st.pyplot(fig)
-
