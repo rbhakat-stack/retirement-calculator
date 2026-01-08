@@ -7,6 +7,16 @@ import hmac
 import copy
 import uuid
 
+from io import BytesIO
+from datetime import datetime
+
+# PDF generation (ReportLab)
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
+
+
 # -----------------------------------------------------------------------------
 # GLOBAL HELPERS (needed early for Supabase loaders)
 # -----------------------------------------------------------------------------
@@ -29,6 +39,624 @@ def _sb_debug_log(msg: str) -> None:
             st.session_state["_sb_debug_msgs"] = logs[-200:]
     except Exception:
         pass
+
+# -----------------------------------------------------------------------------
+# PDF EXPORT UTILITIES (optional; does not change core calculations)
+# -----------------------------------------------------------------------------
+def _pdf_draw_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, leading: float = 14) -> float:
+    """Draw left-aligned wrapped text. Returns the next y position."""
+    if text is None:
+        return y
+    words = str(text).replace("\r", "").split()
+    line = ""
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, "Helvetica", 10) <= max_width:
+            line = test
+        else:
+            c.setFont("Helvetica", 10)
+            c.drawString(x, y, line)
+            y -= leading
+            line = w
+    if line:
+        c.setFont("Helvetica", 10)
+        c.drawString(x, y, line)
+        y -= leading
+    return y
+
+
+def _pdf_money(v: float) -> str:
+    try:
+        return f"${float(v):,.1f}"
+    except Exception:
+        return "$0.0"
+
+
+# -----------------------------------------------------------------------------
+# PDF THEME + DRAW HELPERS (purely presentational)
+# -----------------------------------------------------------------------------
+from reportlab.lib import colors as _rl_colors
+
+_PDF_BRAND = {
+    "primary": _rl_colors.HexColor("#0B2D4D"),   # deep navy
+    "accent":  _rl_colors.HexColor("#1F77B4"),   # blue accent
+    "muted":   _rl_colors.HexColor("#6B7280"),   # gray
+    "light":   _rl_colors.HexColor("#F3F4F6"),   # light gray background
+    "border":  _rl_colors.HexColor("#E5E7EB"),   # table borders
+    "good":    _rl_colors.HexColor("#0F766E"),   # teal
+    "warn":    _rl_colors.HexColor("#B45309"),   # amber
+    "bad":     _rl_colors.HexColor("#B91C1C"),   # red
+}
+
+def _pdf_header(c: canvas.Canvas, W: float, H: float, title: str, subtitle_left: str, subtitle_right: str) -> None:
+    """Draws a branded header band."""
+    band_h = 0.75 * inch
+    c.saveState()
+    c.setFillColor(_PDF_BRAND["primary"])
+    c.rect(0, H - band_h, W, band_h, stroke=0, fill=1)
+
+    c.setFillColor(_rl_colors.white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(0.75 * inch, H - 0.45 * inch, title)
+
+    c.setFont("Helvetica", 9)
+    c.drawRightString(W - 0.75 * inch, H - 0.45 * inch, subtitle_right)
+    c.setFillColor(_PDF_BRAND["light"])
+    # subtle separator line under band
+    c.setStrokeColor(_PDF_BRAND["border"])
+    c.setLineWidth(1)
+    c.line(0.75 * inch, H - band_h - 2, W - 0.75 * inch, H - band_h - 2)
+
+    # second line under title
+    c.setFillColor(_PDF_BRAND["muted"])
+    c.setFont("Helvetica", 9)
+    c.drawString(0.75 * inch, H - 0.67 * inch, subtitle_left)
+    c.restoreState()
+
+def _pdf_footer(c: canvas.Canvas, W: float, H: float, page_num: int) -> None:
+    c.saveState()
+    c.setFont("Helvetica", 8)
+    c.setFillColor(_PDF_BRAND["muted"])
+    c.drawString(0.75 * inch, 0.55 * inch, "Confidential – For personal planning purposes only")
+    c.drawRightString(W - 0.75 * inch, 0.55 * inch, f"Page {page_num}")
+    c.restoreState()
+
+def _pdf_section_title(c: canvas.Canvas, x: float, y: float, W: float, text: str) -> float:
+    c.saveState()
+    c.setFillColor(_PDF_BRAND["light"])
+    c.roundRect(x, y - 16, W, 18, 6, stroke=0, fill=1)
+    c.setFillColor(_PDF_BRAND["primary"])
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(x + 8, y - 12, text)
+    c.restoreState()
+    return y - 26
+
+
+def _pdf_draw_fit_value(c: canvas.Canvas, x: float, y: float, w: float, text: str,
+                        font_name: str = "Helvetica-Bold",
+                        max_font: int = 14, min_font: int = 8,
+                        max_lines: int = 2) -> None:
+    """Draw text within width w, shrinking font and/or wrapping to max_lines."""
+    s = "" if text is None else str(text)
+    s = s.strip()
+    if not s:
+        return
+
+    # Try single line with font shrink
+    for fs in range(max_font, min_font - 1, -1):
+        if c.stringWidth(s, font_name, fs) <= w:
+            c.setFont(font_name, fs)
+            c.drawString(x, y, s)
+            return
+
+    # Wrap into up to max_lines lines at a conservative font size
+    fs = max(min_font, min(max_font - 3, 10))
+    c.setFont(font_name, fs)
+
+    words = s.split()
+    lines = []
+    cur = ""
+    consumed = 0
+    for word in words:
+        trial = (cur + " " + word).strip()
+        if c.stringWidth(trial, font_name, fs) <= w or not cur:
+            cur = trial
+            consumed += 1
+        else:
+            lines.append(cur)
+            cur = word
+            if len(lines) >= max_lines - 1:
+                break
+    if cur:
+        lines.append(cur)
+
+    # Ellipsize last line if not all words were consumed or width still too large
+    ell = "…"
+    if consumed < len(words) or c.stringWidth(lines[-1], font_name, fs) > w:
+        last = lines[-1]
+        while last and c.stringWidth(last + ell, font_name, fs) > w:
+            last = last[:-1].rstrip()
+        lines[-1] = (last + ell) if last else ell
+
+    line_h = fs + 2
+    for i, ln in enumerate(lines[:max_lines]):
+        c.drawString(x, y - i * line_h, ln)
+
+def _pdf_kpi_cards(c: canvas.Canvas, x: float, y: float, W: float, kpis: list[tuple[str, str, str]]) -> float:
+    """kpis: list of (label, value, severity) where severity in {'good','warn','bad','neutral'}"""
+    c.saveState()
+    gap = 10
+    card_h = 52
+    n = max(1, len(kpis))
+    card_w = (W - gap * (n - 1)) / n
+    for i, (label, value, sev) in enumerate(kpis):
+        cx = x + i * (card_w + gap)
+        c.setFillColor(_rl_colors.white)
+        c.setStrokeColor(_PDF_BRAND["border"])
+        c.setLineWidth(1)
+        c.roundRect(cx, y - card_h, card_w, card_h, 10, stroke=1, fill=1)
+
+        color = _PDF_BRAND["accent"]
+        if sev == "good":
+            color = _PDF_BRAND["good"]
+        elif sev == "warn":
+            color = _PDF_BRAND["warn"]
+        elif sev == "bad":
+            color = _PDF_BRAND["bad"]
+
+        # left accent bar
+        c.setFillColor(color)
+        c.rect(cx, y - card_h, 5, card_h, stroke=0, fill=1)
+
+        c.setFillColor(_PDF_BRAND["muted"])
+        c.setFont("Helvetica", 8.5)
+        c.drawString(cx + 10, y - 16, label)
+
+        c.setFillColor(_PDF_BRAND["primary"])
+        # Fit value within card width (avoid overflow)
+        _pdf_draw_fit_value(c, cx + 10, y - 30, card_w - 18, value, font_name="Helvetica-Bold", max_font=14, min_font=8, max_lines=2)
+    c.restoreState()
+    return y - card_h - 14
+
+def _pdf_draw_table(c: canvas.Canvas, x: float, y: float, W: float, df: pd.DataFrame, font_size: int = 9) -> float:
+    """Draw a clean table with header shading and alternating rows."""
+    if df is None or df.empty:
+        return y
+    c.saveState()
+    # prepare strings
+    cols = list(df.columns)
+    data = [cols] + df.astype(str).values.tolist()
+
+    # compute column widths proportional to max string widths
+    maxw = []
+    for j, col in enumerate(cols):
+        w = c.stringWidth(str(col), "Helvetica-Bold", font_size)
+        for i in range(1, min(len(data), 50)):
+            w = max(w, c.stringWidth(str(data[i][j])[:40], "Helvetica", font_size))
+        maxw.append(w + 12)
+
+    total = sum(maxw)
+    if total > W:
+        scale = W / total
+        maxw = [w * scale for w in maxw]
+
+    row_h = 16
+    # header
+    c.setFillColor(_PDF_BRAND["primary"])
+    c.setStrokeColor(_PDF_BRAND["border"])
+    c.roundRect(x, y - row_h, W, row_h, 6, stroke=0, fill=1)
+
+    c.setFillColor(_rl_colors.white)
+    c.setFont("Helvetica-Bold", font_size)
+    cx = x
+    for j, col in enumerate(cols):
+        c.drawString(cx + 6, y - 12, str(col)[:40])
+        cx += maxw[j]
+
+    y -= row_h
+
+    # rows
+    c.setFont("Helvetica", font_size)
+    for i, row in enumerate(data[1:], start=1):
+        bg = _PDF_BRAND["light"] if (i % 2 == 0) else _rl_colors.white
+        c.setFillColor(bg)
+        c.rect(x, y - row_h, W, row_h, stroke=0, fill=1)
+
+        c.setFillColor(_PDF_BRAND["primary"])
+        cx = x
+        for j, val in enumerate(row):
+            c.drawString(cx + 6, y - 12, str(val)[:40])
+            cx += maxw[j]
+
+        # horizontal rule
+        c.setStrokeColor(_PDF_BRAND["border"])
+        c.setLineWidth(0.5)
+        c.line(x, y - row_h, x + W, y - row_h)
+
+        y -= row_h
+        if y < 1.25 * inch:
+            c.restoreState()
+            return y  # caller handles pagination
+    c.restoreState()
+    return y - 6
+
+
+
+def _build_montecarlo_pdf_bytes(user_id: str, snap: dict, sim_settings: dict, res: dict, chart_png: bytes | None) -> bytes:
+    """
+    Build a Monte Carlo PDF report (professional layout).
+    - snap: normalized inputs snapshot (same structure used by the simulator)
+    - sim_settings: Monte Carlo settings shown to the user
+    - res: simulation outputs dict
+    - chart_png: optional PNG bytes for an illustrative chart
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    W, H = letter
+    margin = 0.75 * inch
+
+    page_num = 1
+
+    def _start_page():
+        nonlocal page_num
+        _pdf_header(
+            c, W, H,
+            title="Retirement Range of Outcomes",
+            subtitle_left=f"User: {user_id}",
+            subtitle_right=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+        # usable y start below header band
+        return H - 0.95 * inch
+
+    def _end_page():
+        nonlocal page_num
+        _pdf_footer(c, W, H, page_num)
+        c.showPage()
+        page_num += 1
+
+    y = _start_page()
+    x = margin
+    usable_w = W - 2 * margin
+
+    # -----------------------------
+    # Executive summary (KPIs)
+    # -----------------------------
+    y = _pdf_section_title(c, x, y, usable_w, "Executive summary")
+
+    deplete_pct = float(res.get("deplete_pct", 0.0))
+    median_final = res.get("median_final", res.get("median_final_balance", None))
+    p10_final = res.get("p10_final", res.get("p10_final_balance", None))
+    p90_final = res.get("p90_final", res.get("p90_final_balance", None))
+    typical_deplete_age = res.get("typical_deplete_age", None)
+
+    # Fallbacks if keys differ
+    if median_final is None and "final_balance_percentiles" in res:
+        try:
+            median_final = res["final_balance_percentiles"].get("p50")
+            p10_final = res["final_balance_percentiles"].get("p10")
+            p90_final = res["final_balance_percentiles"].get("p90")
+        except Exception:
+            pass
+
+    # Severity coloring for risk
+    sev = "good"
+    if deplete_pct >= 25:
+        sev = "warn"
+    if deplete_pct >= 50:
+        sev = "bad"
+
+    kpi_cards = [
+        ("Chance of depletion", f"{deplete_pct:.1f}%", sev),
+        ("Median ending balance", _pdf_money(median_final), "neutral"),
+        ("10th–90th ending range", f"{_pdf_money(p10_final)} to {_pdf_money(p90_final)}", "neutral"),
+    ]
+    if typical_deplete_age is not None and typical_deplete_age != "":
+        try:
+            kpi_cards.append(("Typical depletion age", f"{int(float(typical_deplete_age))}", sev))
+        except Exception:
+            pass
+
+    # Fit up to 4 cards on a row; if more, split
+    row1 = kpi_cards[:4]
+    y = _pdf_kpi_cards(c, x, y, usable_w, row1)
+    if len(kpi_cards) > 4:
+        if y < 2.0 * inch:
+            _end_page()
+            y = _start_page()
+        y = _pdf_kpi_cards(c, x, y, usable_w, kpi_cards[4:8])
+
+    # Narrative bullets
+    if y < 2.0 * inch:
+        _end_page()
+        y = _start_page()
+    c.setFont("Helvetica", 10)
+    c.setFillColor(_PDF_BRAND["primary"])
+    life_exp = int(snap.get("life_expectancy", 95) or 95)
+    bullets = [
+        f"Simulation horizon: through age {life_exp}.",
+        "Results are probabilistic and depend on return, inflation, and spending assumptions.",
+    ]
+    if typical_deplete_age is not None:
+        try:
+            bullets.append(f"When depletion occurs, it most often happens around age {int(float(typical_deplete_age))}.")
+        except Exception:
+            pass
+    by = y
+    for b in bullets:
+        c.drawString(x, by, u"\u2022 " + b)
+        by -= 14
+    y = by - 6
+
+    # -----------------------------
+    # Inputs used
+    # -----------------------------
+    if y < 2.2 * inch:
+        _end_page()
+        y = _start_page()
+    y = _pdf_section_title(c, x, y, usable_w, "Inputs used")
+
+    c.setFillColor(_PDF_BRAND["primary"])
+    inputs_lines = [
+        f"Current age: {int(snap.get('current_age', 0))}    Retirement age: {int(snap.get('retire_age', 0))}    Life expectancy: {int(snap.get('life_expectancy', 0))}",
+        f"Annual spend in retirement (today $): {_pdf_money(snap.get('annual_spend_retirement', 0.0))}",
+        f"Annual contribution until retirement: {_pdf_money(snap.get('annual_contribution', 0.0))}",
+        f"Inflation: {float(snap.get('inflation_rate', 0.0))*100:.2f}%    Pre-retire return: {float(snap.get('pre_retire_return', 0.0))*100:.2f}%    Post-retire return: {float(snap.get('post_retire_return', 0.0))*100:.2f}%",
+        f"Social Security / Pension (today $/yr): {_pdf_money(snap.get('social_security', 0.0))} starting at age {int(snap.get('ss_start_age', 0))}",
+    ]
+    c.setFont("Helvetica", 10)
+    for ln in inputs_lines:
+        y = _pdf_draw_wrapped(c, ln, x, y, usable_w, leading=13)
+        if y < 1.4 * inch:
+            _end_page()
+            y = _start_page()
+
+    # -----------------------------
+    # Simulation settings
+    # -----------------------------
+    if y < 2.0 * inch:
+        _end_page()
+        y = _start_page()
+    y = _pdf_section_title(c, x, y, usable_w, "Simulation settings")
+    c.setFont("Helvetica", 10)
+    c.setFillColor(_PDF_BRAND["primary"])
+    for k, v in (sim_settings or {}).items():
+        y = _pdf_draw_wrapped(c, f"{k}: {v}", x, y, usable_w, leading=13)
+        if y < 1.4 * inch:
+            _end_page()
+            y = _start_page()
+
+    # -----------------------------
+    # Chart page
+    # -----------------------------
+    if chart_png:
+        _end_page()
+        y = _start_page()
+        y = _pdf_section_title(c, x, y, usable_w, "Distribution & trajectories (illustrative)")
+        img = ImageReader(BytesIO(chart_png))
+        img_w = usable_w
+        img_h = img_w * 0.60
+        if y - img_h < 1.25 * inch:
+            _end_page()
+            y = _start_page()
+        c.drawImage(img, x, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, mask="auto")
+        y = y - img_h - 10
+
+    # finish
+    _pdf_footer(c, W, H, page_num)
+    c.save()
+    return buf.getvalue()
+
+def _build_compare_pdf_bytes(user_id: str, kpi_df: pd.DataFrame, chart_png: bytes | None, title: str = "Scenario Comparison") -> bytes:
+    """
+    Build a scenario comparison PDF report (professional layout).
+    - kpi_df: dataframe of scenario KPIs (already computed)
+    - chart_png: optional PNG bytes of the comparison chart
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    W, H = letter
+    margin = 0.75 * inch
+    x = margin
+    usable_w = W - 2 * margin
+
+    page_num = 1
+
+    def _start_page():
+        _pdf_header(
+            c, W, H,
+            title=title,
+            subtitle_left=f"User: {user_id}",
+            subtitle_right=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+        return H - 0.95 * inch
+
+    def _end_page():
+        nonlocal page_num
+        _pdf_footer(c, W, H, page_num)
+        c.showPage()
+        page_num += 1
+
+    y = _start_page()
+
+    # -----------------------------
+    # At-a-glance cards
+    # -----------------------------
+    y = _pdf_section_title(c, x, y, usable_w, "At-a-glance")
+    df = (kpi_df.copy() if kpi_df is not None else pd.DataFrame())
+
+    # Derive a few comparisons if possible
+    cards = []
+    try:
+        # best final balance
+        if "Final Balance" in df.columns and "Scenario" in df.columns:
+            # attempt parse currency-like strings
+            def _to_num(v):
+                try:
+                    return float(str(v).replace("$", "").replace(",", ""))
+                except Exception:
+                    return None
+            tmp = df[["Scenario", "Final Balance"]].copy()
+            tmp["_num"] = tmp["Final Balance"].map(_to_num)
+            tmp = tmp.dropna()
+            if not tmp.empty:
+                best = tmp.sort_values("_num", ascending=False).iloc[0]
+                cards.append(("Best ending balance", f"{best['Scenario']}", "neutral"))
+                cards.append(("Ending balance", _pdf_money(best["_num"]), "neutral"))
+    except Exception:
+        pass
+
+    # depletion age / withdrawal rate highlights
+    try:
+        if "Scenario" in df.columns:
+            tmp = df.copy()
+
+            def _to_int(v):
+                try:
+                    s = str(v).strip()
+                    if s == "" or s.lower() in {"none", "nan"}:
+                        return None
+                    return int(float(s))
+                except Exception:
+                    return None
+
+            def _parse_money(v):
+                try:
+                    s = str(v)
+                    # keep digits, minus, decimal
+                    s = re.sub(r"[^0-9\-\.]", "", s)
+                    if s in {"", "-", ".", "-."}:
+                        return None
+                    return float(s)
+                except Exception:
+                    return None
+
+            # 1) Prefer explicit depletion age if present
+            if "Depletion Age" in tmp.columns:
+                tmp["_deplete_age"] = tmp["Depletion Age"].map(_to_int)
+            else:
+                tmp["_deplete_age"] = None
+
+            # 2) If plan is sustainable, infer horizon age from Sustainability text (e.g., "Sustainable to 95")
+            if "Sustainability" in tmp.columns:
+                def _infer_horizon(s):
+                    """Infer planning-horizon age from a sustainability text field."""
+                    try:
+                        s = str(s)
+                        # Common patterns
+                        m = re.search(r"sustainable\s+(?:to|through)\s+(\d+)", s, flags=re.I)
+                        if m:
+                            return int(m.group(1))
+                        # Fallback: first 2–3 digit number in the string (e.g., '... age 95', 'to **95**')
+                        m = re.search(r"(\d{2,3})", s)
+                        return int(m.group(1)) if m else None
+                    except Exception:
+                        return None
+
+                # If some rows have slightly different wording, use a document-level fallback horizon.
+                _global_horizon = None
+                try:
+                    ages = []
+                    for _s in tmp.get("Sustainability", pd.Series(dtype=str)).astype(str).tolist():
+                        ages.extend([int(a) for a in re.findall(r"(\d{2,3})", _s)])
+                    if ages:
+                        _global_horizon = max(ages)
+                except Exception:
+                    _global_horizon = None
+
+                tmp["_horizon_age"] = tmp["Sustainability"].map(_infer_horizon)
+                if _global_horizon is not None:
+                    tmp.loc[tmp["_horizon_age"].isna(), "_horizon_age"] = _global_horizon
+            else:
+                tmp["_horizon_age"] = None
+
+            # Effective "lasts until" age:
+            # - use depletion age when present
+            # - otherwise use inferred horizon (for sustainable plans)
+            tmp["_lasts_to_age"] = tmp["_deplete_age"]
+            tmp.loc[tmp["_lasts_to_age"].isna(), "_lasts_to_age"] = tmp.loc[tmp["_lasts_to_age"].isna(), "_horizon_age"]
+
+            # Tie-breaker: higher ending balance
+            if "Final Balance" in tmp.columns:
+                tmp["_final_num"] = tmp["Final Balance"].map(_parse_money)
+            else:
+                tmp["_final_num"] = None
+
+            tmp2 = tmp.dropna(subset=["_lasts_to_age"])
+            if not tmp2.empty:
+                best = tmp2.sort_values(by=["_lasts_to_age", "_final_num"], ascending=[False, False]).iloc[0]
+                cards.append(("Longest lasting plan", f"{best['Scenario']}", "good"))
+
+                # Show depletion age if it truly depleted; otherwise show the horizon age
+                if best.get("_deplete_age") is not None and str(best.get("Depletion Age", "")).strip() != "":
+                    cards.append(("Depletion age", f"{int(best['_deplete_age'])}", "good"))
+                else:
+                    # Sustainable through horizon
+                    ha = best.get("_horizon_age")
+                    cards.append(("Depletion age", f"{int(ha)}", "good") if ha else ("Depletion age", "N/A", "good"))
+    except Exception:
+        pass
+
+    if not cards:
+        cards = [
+            ("Scenarios compared", f"{len(df)}", "neutral"),
+            ("Report type", "Side-by-side KPIs", "neutral"),
+            ("Chart", "Portfolio paths", "neutral"),
+        ]
+
+    # Show up to 4 cards on first row
+    y = _pdf_kpi_cards(c, x, y, usable_w, cards[:4])
+
+    # -----------------------------
+    # KPI Table
+    # -----------------------------
+    if y < 2.0 * inch:
+        _end_page()
+        y = _start_page()
+
+    y = _pdf_section_title(c, x, y, usable_w, "Key metrics (side-by-side)")
+
+    # Format money columns consistently
+    df2 = df.copy()
+    for col in df2.columns:
+        l = col.lower()
+        if "balance" in l or "assets" in l:
+            df2[col] = df2[col].apply(lambda v: _pdf_money(float(str(v).replace("$","").replace(",",""))) if str(v).strip() != "" else "")
+    # Put Scenario first if exists
+    if "Scenario" in df2.columns:
+        cols = ["Scenario"] + [c for c in df2.columns if c != "Scenario"]
+        df2 = df2[cols]
+
+    y2 = _pdf_draw_table(c, x, y, usable_w, df2, font_size=9)
+    if y2 < 1.25 * inch:
+        _end_page()
+        y = _start_page()
+        # continue table if needed by splitting
+        # For simplicity: draw remaining rows on next page
+        # (table function paginates to caller; here we re-draw full table on new page if it overflowed)
+        y = _pdf_section_title(c, x, y, usable_w, "Key metrics (continued)")
+        y = _pdf_draw_table(c, x, y, usable_w, df2, font_size=9)
+    else:
+        y = y2
+
+    # -----------------------------
+    # Chart page
+    # -----------------------------
+    if chart_png:
+        _end_page()
+        y = _start_page()
+        y = _pdf_section_title(c, x, y, usable_w, "Portfolio trajectory (illustrative)")
+        img = ImageReader(BytesIO(chart_png))
+        img_w = usable_w
+        img_h = img_w * 0.60
+        if y - img_h < 1.25 * inch:
+            _end_page()
+            y = _start_page()
+        c.drawImage(img, x, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, mask="auto")
+        y = y - img_h - 10
+
+    _pdf_footer(c, W, H, page_num)
+    c.save()
+    return buf.getvalue()
 
 def _as_decimal_rate(x, default=0.0):
     """Normalize any rate to decimal form (0.07 or 7 -> 0.07)."""
@@ -1195,6 +1823,48 @@ def _sim_return_draw(rng: np.random.Generator, mu: float, sigma: float, size: in
     return np.clip(r, -0.999, None)
 
 
+
+def _normalize_goals(goals, current_age:int, inflation_mu:float):
+    """Normalize a user-provided goals list into a safe internal structure.
+
+    Each goal is expected to be a dict-like:
+      - title: str
+      - target_age: int
+      - amount: float (today's dollars)
+      - inflate: bool (default True) -> amount grows at inflation until target_age
+      - priority: int/float (optional)
+
+    Returns list of dicts with keys: title, target_age, amount_today, inflate, priority
+    """
+    out = []
+    if not goals:
+        return out
+    for g in goals:
+        try:
+            title = str(g.get("title") or "Goal")
+            target_age = int(g.get("target_age") or g.get("age") or 0)
+            amount = float(g.get("amount") or g.get("amount_today") or 0.0)
+            inflate = bool(g.get("inflate", True))
+            priority = float(g.get("priority", 50))
+        except Exception:
+            continue
+        if target_age <= 0 or amount <= 0:
+            continue
+        # Clamp ages to a reasonable band; ignore if wildly out of horizon.
+        if target_age < current_age - 1 or target_age > current_age + 80:
+            continue
+        out.append(
+            {
+                "title": title,
+                "target_age": target_age,
+                "amount_today": max(0.0, amount),
+                "inflate": inflate,
+                "priority": priority,
+            }
+        )
+    return out
+
+
 def monte_carlo_projection_from_snapshot(
     s: dict,
     n_sims: int = 2000,
@@ -1224,6 +1894,9 @@ def monte_carlo_projection_from_snapshot(
       - deplete_ages: list[int|None] depletion age per simulation
     """
     s = normalize_snapshot(s)
+
+    # Optional one-time goals (e.g., college funding, home purchase, legacy gift)
+    goals = _normalize_goals(s.get('goals', []), current_age=int(s['current_age']), inflation_mu=float(s['inflation_rate']))
 
     if n_trials is not None:
         n_sims = int(n_trials)
@@ -1328,6 +2001,20 @@ def monte_carlo_projection_from_snapshot(
                         if portfolio > (spending_floor_recover_multiple * max(1.0, spend)):
                             floor_active = False
 
+            # --- One-time goals spending at specific ages (treated as an extra withdrawal) ---
+            goal_withdrawal = 0.0
+            if goals:
+                for g in goals:
+                    if int(g["target_age"]) == int(age):
+                        amt = float(g["amount_today"])
+                        if g.get("inflate", True):
+                            years_from_now = max(0, int(age) - int(current_age))
+                            amt *= (1.0 + mu_infl) ** years_from_now
+                        goal_withdrawal += max(0.0, amt)
+
+            if goal_withdrawal > 0.0:
+                withdrawal += goal_withdrawal
+
             # Apply net cashflows then return draw
             start_bal = portfolio
             portfolio = start_bal + contrib - withdrawal
@@ -1390,6 +2077,63 @@ def monte_carlo_projection_from_snapshot(
 
 _init_scenarios()
 
+
+# -----------------------------------------------------------------------------
+# SIDEBAR WIDGET HELPERS (avoid Session State default conflicts)
+# -----------------------------------------------------------------------------
+def sb_num(label: str, key: str, default, min_value=None, max_value=None, step=None, **kwargs):
+    """Number input that avoids Streamlit's 'default + session_state' warning.
+    We seed st.session_state[key] only if missing, and we do NOT pass an explicit
+    'value' argument to the widget.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+    params = {}
+    if min_value is not None:
+        params["min_value"] = min_value
+    if max_value is not None:
+        params["max_value"] = max_value
+    if step is not None:
+        params["step"] = step
+    params.update(kwargs)
+
+    return st.sidebar.number_input(label, key=key, **params)
+
+
+def sb_checkbox(label: str, key: str, default: bool = False, **kwargs):
+    """Checkbox that avoids Streamlit's 'default + session_state' warning.
+    Seeds st.session_state[key] only if missing, and does NOT pass an explicit 'value'.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = bool(default)
+    return st.sidebar.checkbox(label, key=key, **kwargs)
+
+
+def sb_slider(label: str, min_value, max_value, key: str, default=None, **kwargs):
+    """Slider wrapper to avoid Streamlit's 'default + session_state' warning.
+
+    If the key already exists in st.session_state (e.g., loaded from Supabase),
+    we call the slider WITHOUT passing an explicit default value.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = default if default is not None else min_value
+        return st.sidebar.slider(label, min_value, max_value, value=st.session_state[key], key=key, **kwargs)
+    return st.sidebar.slider(label, min_value, max_value, key=key, **kwargs)
+
+
+def sb_selectbox(label: str, options, key: str, default_index: int = 0, **kwargs):
+    """Selectbox wrapper to avoid Streamlit's 'default + session_state' warning."""
+    if key not in st.session_state:
+        # Seed session state with the intended default
+        try:
+            st.session_state[key] = options[default_index]
+        except Exception:
+            st.session_state[key] = options[0] if options else None
+        return st.sidebar.selectbox(label, options=options, index=default_index, key=key, **kwargs)
+    return st.sidebar.selectbox(label, options=options, key=key, **kwargs)
+
+
 # -----------------------------------------------------------------------------
 # TITLE & INTRO
 # -----------------------------------------------------------------------------
@@ -1413,51 +2157,43 @@ with tab1:
     # SIDEBAR INPUTS (KEYED)
     # ---------------------------
     st.sidebar.header("1. Demographics & Status")
-    current_age = st.sidebar.number_input("Current Age", 35, 90, 50, key="current_age")
-    retire_age = st.sidebar.number_input("Retirement Age", 35, 90, 60, key="retire_age")
-    life_expectancy = st.sidebar.number_input("Life Expectancy", 70, 110, 95, key="life_expectancy")
+    current_age = sb_num("Current Age", key="current_age", default=50, min_value=35, max_value=90, step=1)
+    retire_age = sb_num("Retirement Age", key="retire_age", default=60, min_value=35, max_value=90, step=1)
+    life_expectancy = sb_num("Life Expectancy", key="life_expectancy", default=95, min_value=70, max_value=110, step=1)
 
     st.sidebar.header("2. Financials (Current)")
-    current_portfolio = st.sidebar.number_input("Total Invested Assets ($)", value=1_239_000, key="current_portfolio")
-    annual_contribution = st.sidebar.number_input(
-        "Annual Contribution until Retirement ($)", value=65_000, key="annual_contribution"
-    )
-    annual_spend_retirement = st.sidebar.number_input(
-        "Desired Annual Spend in Retirement (Today's $)", value=155_000, key="annual_spend_retirement"
-    )
+    current_portfolio = sb_num("Total Invested Assets ($)", key="current_portfolio", default=1_239_000.0, min_value=0.0, step=10_000.0)
+    annual_contribution = sb_num("Annual Contribution until Retirement ($)", key="annual_contribution", default=65_000.0, min_value=0.0, step=1_000.0)
+    annual_spend_retirement = sb_num("Desired Annual Spend in Retirement (Today's $)", key="annual_spend_retirement", default=155_000.0, min_value=0.0, step=1_000.0)
 
     st.sidebar.header("2B. Portfolio Composition (Optional Multi-Asset)")
-    use_multi_asset = st.sidebar.checkbox(
+    use_multi_asset = sb_checkbox(
         "Use Multi-Asset Portfolio (Cash/Bonds/ETFs/401k)",
-        value=True,
-        help="When enabled, the model tracks each bucket separately and shows a stacked chart.",
         key="use_multi_asset",
+        default=True,
+        help="When enabled, the model tracks each bucket separately and shows a stacked chart.",
     )
 
     flow_mode = "cash_first"
     with st.sidebar:
-        flow_mode = st.selectbox(
-            "Withdrawal Mode",
-            options=["cash_first", "pro_rata"],
-            index=0,
+        flow_mode = sb_selectbox("Withdrawal Mode", options=["cash_first", "pro_rata"], default_index=0, key="flow_mode",
             help="cash_first withdraws from Cash→Bonds→ETFs→401k. pro_rata withdraws proportionally.",
-            key="flow_mode",
-        )
+            )
 
     if use_multi_asset:
         st.sidebar.caption("Balances should roughly sum to Total Invested Assets (above). Yields are annual %.")
 
-        cash_bal = st.sidebar.number_input("Cash Balance ($)", value=200_000, step=10_000, key="cash_bal")
-        cash_yield = st.sidebar.slider("Cash Yield (%)", 0.0, 8.0, 4.0, 0.1, key="cash_yield") / 100
+        cash_bal = sb_num("Cash Balance ($)", key="cash_bal", default=200_000.0, min_value=0.0, step=10_000.0)
+        cash_yield = sb_slider("Cash Yield (%)", 0.0, 8.0, key="cash_yield", default=4.0, step=0.1) / 100
 
-        bonds_bal = st.sidebar.number_input("Bonds/Munis Balance ($)", value=400_000, step=10_000, key="bonds_bal")
-        bonds_yield = st.sidebar.slider("Bonds Yield (%)", 0.0, 10.0, 5.0, 0.1, key="bonds_yield") / 100
+        bonds_bal = sb_num("Bonds/Munis Balance ($)", key="bonds_bal", default=400_000.0, min_value=0.0, step=10_000.0)
+        bonds_yield = sb_slider("Bonds Yield (%)", 0.0, 10.0, key="bonds_yield", default=5.0, step=0.1) / 100
 
-        etfs_bal = st.sidebar.number_input("ETFs Balance ($)", value=439_000, step=10_000, key="etfs_bal")
-        etfs_yield = st.sidebar.slider("ETFs Return (%)", 0.0, 12.0, 7.0, 0.1, key="etfs_yield") / 100
+        etfs_bal = sb_num("ETFs Balance ($)", key="etfs_bal", default=439_000.0, min_value=0.0, step=10_000.0)
+        etfs_yield = sb_slider("ETFs Return (%)", 0.0, 12.0, key="etfs_yield", default=7.0, step=0.1) / 100
 
-        k401_bal = st.sidebar.number_input("401k Balance ($)", value=200_000, step=10_000, key="k401_bal")
-        k401_yield = st.sidebar.slider("401k Return (%)", 0.0, 12.0, 7.0, 0.1, key="k401_yield") / 100
+        k401_bal = sb_num("401k Balance ($)", key="k401_bal", default=200_000.0, min_value=0.0, step=10_000.0)
+        k401_yield = sb_slider("401k Return (%)", 0.0, 12.0, key="k401_yield", default=7.0, step=0.1) / 100
 
         buckets_sum = cash_bal + bonds_bal + etfs_bal + k401_bal
         if abs(buckets_sum - current_portfolio) > 50_000:
@@ -1471,37 +2207,35 @@ with tab1:
         cash_yield = bonds_yield = etfs_yield = k401_yield = 0.0
 
     st.sidebar.header("3. Tax Profile (Current Income)")
-    annual_gross_income = st.sidebar.number_input("Annual Gross Income (Pre-Tax $)", value=300_000, key="annual_gross_income")
+    annual_gross_income = sb_num("Annual Gross Income (Pre-Tax $)", key="annual_gross_income", default=300_000.0, min_value=0.0, step=1_000.0)
 
-    filing_status = st.sidebar.selectbox(
-        "Filing Status",
+    filing_status = sb_selectbox("Filing Status",
         options=["single", "married"],
         format_func=lambda x: "Single" if x == "single" else "Married Filing Jointly",
-        key="filing_status",
-    )
+        key="filing_status")
 
-    state_code = st.sidebar.selectbox("State", options=["NJ", "Other"], index=0, key="state_code")
+    state_code = sb_selectbox("State", options=["NJ", "Other"], default_index=0, key="state_code")
 
     manual_state_rate = 0.0
     if state_code == "Other":
-        manual_state_rate = st.sidebar.slider("Other State Effective Tax Rate (%)", 0.0, 15.0, 5.0, 0.5, key="manual_state_rate")
+        manual_state_rate = sb_slider("Other State Effective Tax Rate (%)", 0.0, 15.0, key="manual_state_rate", default=5.0, step=0.5)
     else:
         # ensure key exists
         st.session_state["manual_state_rate"] = 0.0
 
-    dependents = st.sidebar.number_input("Number of Dependents", 0, 10, 0, key="dependents")
+    dependents = sb_num("Number of Dependents", key="dependents", default=0, min_value=0, max_value=10, step=1)
 
     st.sidebar.header("4. Household Expenses & Cashflow")
-    annual_expenses = st.sidebar.number_input("Annual Expenses (Today's $)", value=200_000, key="annual_expenses")
+    annual_expenses = sb_num("Annual Expenses (Today's $)", key="annual_expenses", default=200_000, min_value=0, max_value=10_000_000, step=1000)
 
     st.sidebar.header("5. Macro & Return Assumptions")
-    inflation_rate = st.sidebar.slider("Inflation Rate (%)", 1.0, 5.0, 3.0, key="inflation_rate") / 100
-    pre_retire_return = st.sidebar.slider("Pre-Retirement Growth (%)", 1.0, 12.0, 7.0, key="pre_retire_return") / 100
-    post_retire_return = st.sidebar.slider("Post-Retirement Growth (Avg) (%)", 1.0, 10.0, 4.5, key="post_retire_return") / 100
+    inflation_rate = sb_slider("Inflation Rate (%)", 1.0, 5.0, key="inflation_rate", default=3.0, step=0.1) / 100
+    pre_retire_return = sb_slider("Pre-Retirement Growth (%)", 1.0, 12.0, key="pre_retire_return", default=7.0, step=0.1) / 100
+    post_retire_return = sb_slider("Post-Retirement Growth (Avg) (%)", 1.0, 10.0, key="post_retire_return", default=4.5, step=0.1) / 100
 
     st.sidebar.header("6. Guaranteed Income (Retirement)")
-    social_security = st.sidebar.number_input("Social Security/Pension (Annual $)", value=30_000, key="social_security")
-    ss_start_age = st.sidebar.number_input("SS/Pension Start Age", 60, 75, 67, key="ss_start_age")
+    social_security = sb_num("Social Security/Pension (Annual $)", key="social_security", default=30_000, min_value=0, max_value=1_000_000, step=1000)
+    ss_start_age = sb_num("SS/Pension Start Age", key="ss_start_age", default=67, min_value=60, max_value=75, step=1)
 
     # Persist current single-scenario inputs per user (best-effort)
     _maybe_persist_single_snapshot(normalize_snapshot(get_current_inputs_snapshot()))
@@ -2232,7 +2966,35 @@ with tab2:
             ax.set_ylabel("Total Portfolio ($)")
             ax.legend(loc="upper right")
             st.pyplot(fig)
-# =============================================================================
+
+            # ---------------------------
+            # PDF EXPORT (Scenario Comparison)
+            # ---------------------------
+            try:
+                comp_png = None
+                try:
+                    _bio2 = BytesIO()
+                    fig.savefig(_bio2, format="png", dpi=160, bbox_inches="tight")
+                    comp_png = _bio2.getvalue()
+                except Exception:
+                    comp_png = None
+
+                comp_pdf = _build_compare_pdf_bytes(
+                    user_id=st.session_state.get("current_user", "unknown"),
+                    kpi_df=kpi_df,
+                    chart_png=comp_png,
+                    title="Scenario Comparison (Side-by-Side)",
+                )
+
+                st.download_button(
+                    "Download comparison PDF",
+                    data=comp_pdf,
+                    file_name=f"scenario_comparison_{st.session_state.get('current_user','user')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"Comparison PDF export is unavailable due to an internal error: {e}")# =============================================================================
 # TAB 3: RANGE OF OUTCOMES (MONTE CARLO) - OPT-IN
 # =============================================================================
 with tab3:
@@ -2258,8 +3020,10 @@ with tab3:
     else:
         scenarios_mc = _get_scenarios()
         if not scenarios_mc:
-            st.warning("No saved scenarios found. Create/save a scenario in the Compare tab first, or switch to current inputs.")
-            st.stop()
+            st.warning("No saved scenarios found. Falling back to your current sidebar inputs for simulation.")
+            snap = normalize_snapshot(get_current_inputs_snapshot())
+            st.info("Simulating your current sidebar inputs.")
+            src_mode = "Use my current inputs (from the sidebar)"
         id_to_label_mc = {sc["id"]: f'{sc["name"]} ({sc["id"]})' for sc in scenarios_mc}
         sel_id = st.selectbox(
             "Select a saved scenario",
@@ -2384,72 +3148,126 @@ with tab3:
         res = st.session_state.get("mc_last_result")
         if not res:
             st.info("Adjust settings above and click **Run Simulation** to view the simulated range of outcomes.")
-            st.stop()
 
-        def _money(x: float) -> str:
-            return f"${float(x):,.1f}"
-
-        st.markdown("### Key takeaways")
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("Chance of running out of funds", f"{res['prob_deplete']*100:.1f}%")
-        with m2:
-            st.metric("Median ending balance", _money(res["median_final"]))
-        with m3:
-            st.metric("10th percentile ending balance", _money(res["p10_final"]))
-        with m4:
-            st.metric("90th percentile ending balance", _money(res["p90_final"]))
-
+        if res:
+            def _money(x: float) -> str:
+                return f"${float(x):,.1f}"
     
-        # ---------------------------------------------------------
-        # Executive-friendly narrative summary (auto-generated)
-        # ---------------------------------------------------------
-        deplete_pct = res.get("prob_depletion", 0.0) * 100.0
-        median_final = res.get("median_final", float(np.median(res["final_balances"])))
-        p10_final = res.get("p10_final", float(np.percentile(res["final_balances"], 10)))
-        p90_final = res.get("p90_final", float(np.percentile(res["final_balances"], 90)))
-
-        st.markdown("#### Plain-English summary (based on the simulation)")
-        st.markdown(
-            f"""
-- **Chance of running out of money before age {int(snap['life_expectancy'])}:** {deplete_pct:.1f}%
-- **Most likely outcome (median):** around {_money(median_final)} left at age {int(snap['life_expectancy'])}
-- **Cautious view (10th percentile):** around {_money(p10_final)} left
-- **Optimistic view (90th percentile):** around {_money(p90_final)} left
-"""
-        )
-
-        # Interpret depletion age
-        tda = res.get("typical_deplete_age", None)
-        if tda is None or (isinstance(tda, float) and np.isnan(tda)):
-            st.success(f"In these simulations, funds generally last through age {{int(snap['life_expectancy'])}}.")
-        else:
-            st.warning(f"In the simulations where money runs out, it typically happens around **age {{int(tda)}}**.")
-
-        st.markdown(
+            st.markdown("### Key takeaways")
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Chance of running out of funds", f"{res['prob_deplete']*100:.1f}%")
+            with m2:
+                st.metric("Median ending balance", _money(res["median_final"]))
+            with m3:
+                st.metric("10th percentile ending balance", _money(res["p10_final"]))
+            with m4:
+                st.metric("90th percentile ending balance", _money(res["p90_final"]))
+    
+        
+            # ---------------------------------------------------------
+            # Executive-friendly narrative summary (auto-generated)
+            # ---------------------------------------------------------
+            deplete_pct = float(res.get("prob_deplete", 0.0)) * 100.0
+            median_final = res.get("median_final", float(np.median(res["final_balances"])))
+            p10_final = res.get("p10_final", float(np.percentile(res["final_balances"], 10)))
+            p90_final = res.get("p90_final", float(np.percentile(res["final_balances"], 90)))
+    
+            st.markdown("#### Plain-English summary (based on the simulation)")
+            st.markdown(
+                f"""
+    - **Chance of running out of money before age {int(snap['life_expectancy'])}:** {deplete_pct:.1f}%
+    - **Most likely outcome (median):** around {_money(median_final)} left at age {int(snap['life_expectancy'])}
+    - **Cautious view (10th percentile):** around {_money(p10_final)} left
+    - **Optimistic view (90th percentile):** around {_money(p90_final)} left
+    """
+            )
+    
+            # Interpret depletion age
+            tda = res.get("typical_deplete_age", None)
+            if tda is None or (isinstance(tda, float) and np.isnan(tda)):
+                st.success(f"In these simulations, funds generally last through age {int(snap['life_expectancy'])}.")
+            else:
+                st.warning(f"In the simulations where money runs out, it typically happens around **age {int(tda)}**.")
+    
+            st.markdown(
+                """
+            **How to read the percentiles:**
+            - The **10th percentile** is a “bad but plausible” outcome: **9 out of 10 simulations do better**, 1 out of 10 do worse.
+            - The **90th percentile** is a “good but plausible” outcome: **9 out of 10 simulations do worse**, 1 out of 10 do better.
+            - Percentiles refer to the **amount left over** at the end (age shown), not a guarantee.
             """
-        **How to read the percentiles:**
-        - The **10th percentile** is a “bad but plausible” outcome: **9 out of 10 simulations do better**, 1 out of 10 do worse.
-        - The **90th percentile** is a “good but plausible” outcome: **9 out of 10 simulations do worse**, 1 out of 10 do better.
-        - Percentiles refer to the **amount left over** at the end (age shown), not a guarantee.
-        """
-        )
-
-        # Note any active simulation safety rules
-        rules = []
-        if use_spending_floor:
-            rules.append("temporary spending cuts in stressed years")
-        if use_guardrails:
-            rules.append("dynamic withdrawal guardrails (raise/cut rules)")
-        if rules:
-            st.info("This run included: " + ", ".join(rules) + ". These rules change outcomes only in this Monte Carlo tab.")
-        fig2, ax2 = plt.subplots(figsize=(10, 5))
-        ax2.hist(res["final_balances"], bins=40)
-        ax2.set_xlabel(f"Ending Balance at Age {int(snap['life_expectancy'])} ($)")
-        ax2.set_ylabel("Number of simulations")
-        st.pyplot(fig2)
-
-        st.caption(
-            "This simulation uses simplified assumptions (normally distributed annual returns/inflation with fixed volatilities). "
-            "It is intended for planning insights, not financial advice."
-        )
+            )
+    
+            # Note any active simulation safety rules
+            rules = []
+            if use_spending_floor:
+                rules.append("temporary spending cuts in stressed years")
+            if use_guardrails:
+                rules.append("dynamic withdrawal guardrails (raise/cut rules)")
+            if rules:
+                st.info("This run included: " + ", ".join(rules) + ". These rules change outcomes only in this Monte Carlo tab.")
+            fig2, ax2 = plt.subplots(figsize=(10, 5))
+            ax2.hist(res["final_balances"], bins=40)
+            ax2.set_xlabel(f"Ending Balance at Age {int(snap['life_expectancy'])} ($)")
+            ax2.set_ylabel("Number of simulations")
+            st.pyplot(fig2)
+    
+            st.caption(
+                "This simulation uses simplified assumptions (normally distributed annual returns/inflation with fixed volatilities). "
+                "It is intended for planning insights, not financial advice."
+            )
+            # ---------------------------
+            # PDF EXPORT (Range of Outcomes)
+            # ---------------------------
+            try:
+                sim_settings = {
+                    "Simulations": int(n_trials),
+                    "Random seed": int(seed),
+                    "Inflation mean": f"{float(snap.get('inflation_rate', 0.0)) * 100:.2f}%",
+                    "Inflation volatility": f"{float(infl_sigma_pct):.2f}%",
+                    "Pre-retirement mean return": f"{float(snap.get('pre_retire_return', 0.0)) * 100:.2f}%",
+                    "Pre-retirement return volatility": f"{float(pre_sigma_pct):.2f}%",
+                    "Post-retirement mean return": f"{float(snap.get('post_retire_return', 0.0)) * 100:.2f}%",
+                    "Post-retirement return volatility": f"{float(post_sigma_pct):.2f}%",
+                    "Spending cut rule enabled": "Yes" if bool(use_spending_floor) else "No",
+                    "Trigger threshold (assets vs spending)": f"{float(spending_floor_multiple):.2f}x" if bool(use_spending_floor) else "N/A",
+                    "Spending cut %": f"{float(spending_floor_cut_pct) * 100:.1f}%" if bool(use_spending_floor) else "N/A",
+                    "Recovery threshold": f"{float(spending_floor_recover_multiple):.2f}x" if bool(use_spending_floor) else "N/A",
+                    "Guardrails enabled": "Yes" if bool(use_guardrails) else "No",
+                    "Guardrail band around initial WR": f"{float(guardrail_band_pct) * 100:.1f}%" if bool(use_guardrails) else "N/A",
+                    "Cut when above upper guardrail": f"{float(guardrail_cut_pct) * 100:.1f}%" if bool(use_guardrails) else "N/A",
+                    "Raise when below lower guardrail": f"{float(guardrail_raise_pct) * 100:.1f}%" if bool(use_guardrails) else "N/A",
+                    "Raise cap above baseline": f"{float(guardrail_raise_cap_pct) * 100:.1f}%" if bool(use_guardrails) else "N/A",
+                }
+    
+                # Capture chart image (best-effort)
+                chart_png = None
+                try:
+                    _bio = BytesIO()
+                    fig2.savefig(_bio, format="png", dpi=160, bbox_inches="tight")
+                    chart_png = _bio.getvalue()
+                except Exception:
+                    chart_png = None
+    
+                pdf_bytes = _build_montecarlo_pdf_bytes(
+                    user_id=st.session_state.get("current_user", "unknown"),
+                    snap=snap,
+                    sim_settings=sim_settings,
+                    res=res,
+                    chart_png=chart_png,
+                )
+    
+                st.download_button(
+                    "Download PDF report (Range of Outcomes)",
+                    data=pdf_bytes,
+                    file_name=f"retirement_range_of_outcomes_{st.session_state.get('current_user','user')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"PDF export is unavailable due to an internal error: {e}")
+    
+    
+    
+    # =============================================================================
