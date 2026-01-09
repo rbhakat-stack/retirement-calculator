@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import copy
 import uuid
+import math
 
 from io import BytesIO
 from datetime import datetime
@@ -70,6 +71,17 @@ def _pdf_money(v: float) -> str:
         return f"${float(v):,.1f}"
     except Exception:
         return "$0.0"
+
+
+# -----------------------------------------------------------------------------
+# GENERAL CURRENCY FORMATTER (used by UI modules; keeps changes additive)
+# -----------------------------------------------------------------------------
+def _money(v: float) -> str:
+    """Format a numeric value as whole-dollar USD (e.g., $155,000)."""
+    try:
+        return f"${float(v):,.0f}"
+    except Exception:
+        return "$0"
 
 
 # -----------------------------------------------------------------------------
@@ -1930,6 +1942,82 @@ def retirement_confidence_score(df: pd.DataFrame, retire_age: int, current_age: 
     }
 
 
+
+# -----------------------------------------------------------------------------
+# PHASE 1 (2.B): "How much can I spend?" (Monte Carlo-backed, runs on demand)
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _sustainable_spend_mc_cached(
+    snap_norm: dict,
+    target_success: float,
+    n_sims: int,
+    seed: int,
+    pre_sigma: float,
+    post_sigma: float,
+    infl_sigma: float,
+) -> dict:
+    """Return sustainable annual retirement spend (today $) for a target success rate.
+
+    - Uses the existing Monte Carlo engine (monte_carlo_projection_from_snapshot) with
+      a small number of simulations for speed.
+    - This function is cached to keep the UI responsive.
+    """
+    s0 = copy.deepcopy(snap_norm)
+
+    # Determine a reasonable search band.
+    # Lower bound: $0 (always feasible). Upper bound: max(3x planned spend, 10% of starting portfolio).
+    planned = float(s0.get("annual_spend_retirement", 0.0))
+    start_port = float(s0.get("current_portfolio", 0.0))
+
+    lo = 0.0
+    hi = max(planned * 3.0, start_port * 0.10, 50_000.0)
+
+    # Evaluate feasibility at upper bound; if still succeeds, expand a bit (bounded)
+    def _success_for_spend(sp: float) -> float:
+        s = copy.deepcopy(s0)
+        s["annual_spend_retirement"] = float(max(0.0, sp))
+        res = monte_carlo_projection_from_snapshot(
+            s,
+            n_sims=int(n_sims),
+            seed=int(seed),
+            pre_sigma=float(pre_sigma),
+            post_sigma=float(post_sigma),
+            infl_sigma=float(infl_sigma),
+        )
+        prob_deplete = float(res.get("prob_deplete", 0.0))
+        return 1.0 - prob_deplete
+
+    succ_hi = _success_for_spend(hi)
+    # If very safe even at hi, expand once (still bounded) to better bracket the max
+    if succ_hi >= target_success and hi < 5_000_000:
+        hi2 = min(5_000_000.0, hi * 1.5)
+        succ_hi2 = _success_for_spend(hi2)
+        if succ_hi2 >= target_success:
+            hi = hi2
+            succ_hi = succ_hi2
+
+    # Binary search
+    tol = 500.0  # $500/year tolerance
+    best = lo
+    best_succ = 1.0
+
+    # If even hi fails, we will return a value below planned spend (binary search will find it)
+    for _ in range(18):  # ~2^18 resolution is sufficient given tol + noisy MC
+        mid = (lo + hi) / 2.0
+        succ = _success_for_spend(mid)
+        if succ >= target_success:
+            best = mid
+            best_succ = succ
+            lo = mid
+        else:
+            hi = mid
+        if (hi - lo) <= tol:
+            break
+
+    # Round down to nearest $100 for nicer UX
+    best = float(max(0.0, math.floor(best / 100.0) * 100.0))
+    return {"spend": best, "success": float(best_succ), "target": float(target_success), "n_sims": int(n_sims)}
+
 def _sim_return_draw(rng: np.random.Generator, mu: float, sigma: float, size: int) -> np.ndarray:
     """
     Draw arithmetic returns with a simple guardrail so we never go below -100%.
@@ -2497,6 +2585,101 @@ with tab1:
         # Never break existing rendering
         pass
 
+    
+    # ---------------------------
+    # PHASE 1 (2.B): How much can I spend? (Monte Carlo-backed, on-demand)
+    # ---------------------------
+    st.markdown("### 2. How much can I spend in retirement? (Sustainable spending)")
+    _show_spend_calc = st.checkbox("Show sustainable spending calculator", value=False, key="show_spend_calc")
+    if _show_spend_calc:
+        st.caption(
+            "This tool estimates the *maximum* sustainable annual retirement spending (in today's dollars) for different confidence levels. "
+            "It uses the same Monte Carlo engine as the Simulation tab, but runs a smaller number of simulations for speed."
+        )
+
+        csp1, csp2, csp3 = st.columns([1, 1, 2])
+        with csp1:
+            spend_simulations = st.number_input(
+                "Simulations (speed vs accuracy)",
+                min_value=300, max_value=6000, value=900, step=100,
+                help="More simulations increase stability but take longer to compute.",
+                key="spend_calc_n_sims",
+            )
+        with csp2:
+            spend_seed = st.number_input(
+                "Random seed",
+                min_value=0, max_value=1_000_000, value=42, step=1,
+                key="spend_calc_seed",
+            )
+        with csp3:
+            st.markdown("**Confidence levels**")
+            st.write("• Conservative: 90% success")
+            st.write("• Balanced: 80% success")
+            st.write("• Aggressive: 70% success")
+
+        run_spend = st.button("Compute sustainable spending ranges", use_container_width=True, key="run_spend_calc")
+
+        if run_spend:
+            try:
+                with st.spinner("Running simulations to estimate sustainable spending..."):
+                    snap_now = normalize_snapshot(get_current_inputs_snapshot())
+
+                    # Use the same default volatilities as the Monte Carlo tab defaults.
+                    pre_sigma = 0.12
+                    post_sigma = 0.09
+                    infl_sigma = 0.01
+
+                    targets = [("Conservative (90%)", 0.90), ("Balanced (80%)", 0.80), ("Aggressive (70%)", 0.70)]
+                    results = []
+                    for label, tgt in targets:
+                        out = _sustainable_spend_mc_cached(
+                            snap_now,
+                            target_success=float(tgt),
+                            n_sims=int(spend_simulations),
+                            seed=int(spend_seed),
+                            pre_sigma=float(pre_sigma),
+                            post_sigma=float(post_sigma),
+                            infl_sigma=float(infl_sigma),
+                        )
+                        results.append((label, out))
+
+                    st.session_state["spend_calc_results"] = results
+
+            except Exception as e:
+                st.warning(f"Unable to compute sustainable spending due to an internal error: {e}")
+
+        results = st.session_state.get("spend_calc_results", None)
+        if results:
+            st.markdown("##### Estimated sustainable annual retirement spending (today's dollars)")
+            cols = st.columns(3)
+            for i, (label, out) in enumerate(results[:3]):
+                with cols[i]:
+                    st.metric(
+                        label,
+                        _money(out.get("spend", 0.0)),
+                        help=f"Target success rate: {int(float(out.get('target', 0.0))*100)}% using {int(out.get('n_sims', 0))} simulations.",
+                    )
+            st.caption(
+                "Interpretation: A higher confidence level (e.g., 90%) is more conservative. "
+                "Results are estimates and may vary slightly between runs due to randomness."
+            )
+
+            # Show how current planned spending compares (if available)
+            try:
+                planned_spend = float(annual_spend_retirement)
+                best_balanced = float(results[1][1].get("spend", 0.0)) if len(results) > 1 else None
+                if best_balanced is not None and planned_spend > 0:
+                    delta = best_balanced - planned_spend
+                    if abs(delta) < 500:
+                        st.success("Your planned retirement spending is approximately aligned with the Balanced (80%) sustainable estimate.")
+                    elif delta >= 0:
+                        st.info(f"At the Balanced (80%) level, you may be able to increase spending by about {_money(delta)} per year (planning estimate).")
+                    else:
+                        st.warning(f"At the Balanced (80%) level, you may need to reduce spending by about {_money(abs(delta))} per year (planning estimate).")
+            except Exception:
+                pass
+
+            st.markdown("---")
     # ---------------------------
     # SECTION 1: FIRE OVERVIEW
     # ---------------------------
@@ -2860,9 +3043,9 @@ with tab1:
             st.markdown("#### Portfolio Risk Assessment")
             st.markdown(result["risk_assessment"])
 
-# =============================================================================
-# TAB 2: COMPARE SCENARIOS
-# =============================================================================
+    # =============================================================================
+    # TAB 2: COMPARE SCENARIOS
+    # =============================================================================
 with tab2:
     st.subheader("Scenario Comparison (Side-by-Side)")
 
