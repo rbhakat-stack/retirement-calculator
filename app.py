@@ -2558,40 +2558,89 @@ with tab1:
 
 
     # ---------------------------
-    # FOUNDATIONAL: Retirement Confidence Score (heuristic)
-    # ---------------------------
-    try:
-        _rcs = retirement_confidence_score(df, retire_age=retire_age, current_age=current_age, life_expectancy=life_expectancy)
-        _score = int(_rcs.get("score", 0))
-        _label = str(_rcs.get("label", ""))
-        _notes = _rcs.get("notes", []) or []
 
-        st.subheader("Retirement Confidence Score")
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.metric("Score (0–100)", f"{_score}", help="A simple, explainable heuristic based on sustainability to your planning horizon, withdrawal pressure, and ending-balance buffer. For probabilistic confidence, use Monte Carlo.")
-            st.progress(_score / 100.0)
-            st.caption(f"Status: {_label}")
-        with c2:
-            if isinstance(_notes, (list, tuple)) and _notes:
-                st.markdown("**Key drivers**")
-                for _n in _notes[:4]:
-                    st.write(f"• {_n}")
-            else:
-                st.write("")
+    with st.expander("FIRE Targets (Rule of Thumb)", expanded=True):
+        # ---------------------------
+        # SECTION 1: FIRE OVERVIEW
+        # ---------------------------
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Standard FIRE (25x)", f"${annual_spend_retirement * 25:,.0f}", help="Target based on ~4% withdrawal rate.")
+        with col2:
+            st.metric("Fat/Safe FIRE (33x)", f"${annual_spend_retirement * 33:,.0f}", help="More conservative target based on ~3% withdrawal rate.")
+        with col3:
+            gap_25x = (annual_spend_retirement * 25) - current_portfolio
+            st.metric("Gap to 25x", f"${gap_25x:,.0f}", help="Difference between your current portfolio and 25x spending target. Negative gap indicates you have exceeded 25x.")
 
+        st.caption("These rules of thumb provide a quick readiness check before looking at detailed cashflow modeling.")
         st.markdown("---")
-    except Exception:
-        # Never break existing rendering
-        pass
 
-    
-    # ---------------------------
-    # PHASE 1 (2.B): How much can I spend? (Monte Carlo-backed, on-demand)
-    # ---------------------------
-    st.markdown("### 2. How much can I spend in retirement? (Sustainable spending)")
-    _show_spend_calc = st.checkbox("Show sustainable spending calculator", value=False, key="show_spend_calc")
-    if _show_spend_calc:
+
+    with st.expander("Stress Test: Capacity for Loss", expanded=False):
+        # ---------------------------
+        # SECTION 4: STRESS TEST
+        # ---------------------------
+        st.markdown("Simulate an immediate market shock to understand downside resilience.")
+
+        crash_scenario = st.slider("Simulated Market Drop at Retirement (%)", 0, 50, 20, key="crash_scenario")
+
+        if crash_scenario > 0:
+            stressed_pot = current_portfolio * (1 - (crash_scenario / 100))
+            st.write(f"Portfolio immediately after crash: **${stressed_pot:,.0f}**")
+
+            if stressed_pot > (annual_spend_retirement * 25):
+                st.success(
+                    "Even after this shock, the portfolio remains above the standard **25x FIRE** threshold. "
+                    "You retain a reasonable margin of safety under current assumptions."
+                )
+            else:
+                st.warning(
+                    "This shock brings the portfolio **below** the 25x FIRE threshold. "
+                    "You may need to revisit spending, retirement age, or risk assumptions."
+                )
+
+        st.caption("This is a simple single-period stress test. In practice, you would combine this with scenario analysis and more detailed risk modeling.")
+
+
+    with st.expander("Retirement Confidence Score", expanded=True):
+        # ---------------------------
+        # SECTION 2: Retirement Confidence Score (heuristic)
+        # ---------------------------
+        try:
+            _rcs = retirement_confidence_score(
+                df,
+                retire_age=retire_age,
+                current_age=current_age,
+                life_expectancy=life_expectancy,
+            )
+            _score = int(_rcs.get("score", 0))
+            _label = str(_rcs.get("label", ""))
+            _notes = _rcs.get("notes", []) or []
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.metric("Score (0–100)", f"{_score}", help="Heuristic summary of sustainability based on depletion timing and ending balance buffer. For probabilistic confidence, use Monte Carlo.")
+                st.progress(max(0.0, min(1.0, _score / 100.0)))
+                st.caption(f"Status: {_label}")
+            with c2:
+                if isinstance(_notes, (list, tuple)) and _notes:
+                    st.markdown("**Key drivers**")
+                    for _n in _notes[:4]:
+                        st.write(f"• {_n}")
+                else:
+                    st.write("")
+
+            st.markdown("---")
+        except Exception:
+            # Never break existing rendering
+            pass
+
+
+
+        # ---------------------------
+        # PHASE 1 (2.B): How much can I spend? (Monte Carlo-backed, on-demand)
+        # ---------------------------
+
+    with st.expander("How much can I spend in retirement? (Sustainable spending)", expanded=False):
         st.caption(
             "This tool estimates the *maximum* sustainable annual retirement spending (in today's dollars) for different confidence levels. "
             "It uses the same Monte Carlo engine as the Simulation tab, but runs a smaller number of simulations for speed."
@@ -2679,373 +2728,436 @@ with tab1:
             except Exception:
                 pass
 
+
+
+    with st.expander("Dynamic retirement date finder (retirement-age sensitivity)", expanded=False):
+        # PHASE 1 (2.D): Dynamic Retirement Date Finder (on-demand)
+        # ---------------------------
+        st.caption(
+            "This tool varies your retirement age (keeping all other inputs the same) and estimates the success probability (1 − probability of depletion) for each age. "
+            "Use it to identify an earliest viable retirement age and a more comfortable age with additional cushion."
+        )
+        cdf1, cdf2, cdf3, cdf4 = st.columns([1.2, 1.2, 1, 1])
+        with cdf1:
+            target_success = st.slider("Target success probability", 0.60, 0.95, 0.80, 0.01, key="retwin_target_success")
+        with cdf2:
+            cushion = st.slider("Comfort cushion (+%)", 0.00, 0.20, 0.10, 0.01, key="retwin_cushion")
+        with cdf3:
+            win_sims = st.number_input("Simulations", min_value=300, max_value=6000, value=700, step=100, key="retwin_sims")
+        with cdf4:
+            win_seed = st.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1, key="retwin_seed")
+
+        sra1, sra2 = st.columns(2)
+        with sra1:
+            search_start_age = st.number_input("Search start age", min_value=0, max_value=120, value=int(max(current_age, retire_age - 5)), step=1, key="retwin_start_age")
+        with sra2:
+            search_end_age = st.number_input("Search end age", min_value=0, max_value=120, value=int(retire_age + 10), step=1, key="retwin_end_age")
+
+        def _success_probability_for_retire_age(snap: dict, test_retire_age: int, n_sims: int, seed: int) -> float:
+            snap2 = dict(snap)
+            snap2["retire_age"] = int(test_retire_age)
+            # Reuse the same MC engine used elsewhere
+            res = monte_carlo_projection_from_snapshot(
+                snap2,
+                n_sims=int(n_sims),
+                seed=int(seed),
+                pre_sigma=0.12,
+                post_sigma=0.09,
+                infl_sigma=0.01,
+            )
+            p_deplete = float(res.get("prob_deplete", 1.0))
+            return max(0.0, min(1.0, 1.0 - p_deplete))
+
+        @st.cache_data(show_spinner=False, ttl=3600)
+        def _retwin_scan_cached(snap: dict, start_age: int, end_age: int, n_sims: int, seed: int):
+            ages = list(range(int(start_age), int(end_age) + 1))
+            vals = []
+            for a in ages:
+                vals.append(_success_probability_for_retire_age(snap, a, n_sims, seed))
+            return ages, vals
+
+        if st.button("Find retirement window", key="retwin_run_btn"):
+            # Clamp invalid ranges
+            _start = int(max(search_start_age, current_age))
+            _end = int(max(search_end_age, _start))
+            snap_now = normalize_snapshot(get_current_inputs_snapshot())
+            with st.spinner("Running simulations across retirement ages..."):
+                ages, probs = _retwin_scan_cached(snap_now, _start, _end, int(win_sims), int(win_seed))
+
+            # Identify earliest age meeting target and comfort target
+            comfort_target = min(0.99, float(target_success + cushion))
+            earliest = None
+            comfortable = None
+            for a, p in zip(ages, probs):
+                if earliest is None and p >= target_success:
+                    earliest = a
+                if comfortable is None and p >= comfort_target:
+                    comfortable = a
+            planned_success = _success_probability_for_retire_age(snap_now, int(retire_age), int(win_sims), int(win_seed))
+
+            st.subheader("Recommended retirement window (based on simulations)")
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Earliest viable age", "Not found" if earliest is None else str(earliest))
+            with m2:
+                st.metric("More comfortable age", "Not found" if comfortable is None else str(comfortable))
+            with m3:
+                st.metric("Planned retirement age success", f"{planned_success*100:.1f}%")
+
+            if earliest is None:
+                best_p = max(probs) if probs else 0.0
+                best_age = ages[probs.index(best_p)] if probs else _end
+                st.warning(
+                    f"No retirement age in the selected range reached the target success probability ({int(target_success*100)}%). "
+                    f"Best in range: {best_p*100:.1f}% at age {best_age}. Try increasing the search range, reducing spending, or increasing contributions."
+                )
+
+            # Plot curve
+            fig2, ax2 = plt.subplots(figsize=(10, 4))
+            ax2.plot(ages, probs, linewidth=2)
+            ax2.axhline(float(target_success), linestyle="--")
+            ax2.set_xlabel("Retirement age")
+            ax2.set_ylabel("Success probability")
+            ax2.set_ylim(0, 1)
+            st.pyplot(fig2)
             st.markdown("---")
-    # ---------------------------
-    # SECTION 1: FIRE OVERVIEW
-    # ---------------------------
-    st.header("1. FIRE Targets (Rule of Thumb)")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Standard FIRE (25x)", f"${annual_spend_retirement * 25:,.0f}", help="Target based on ~4% withdrawal rate.")
-    with col2:
-        st.metric("Fat/Safe FIRE (33x)", f"${annual_spend_retirement * 33:,.0f}", help="More conservative target based on ~3% withdrawal rate.")
-    with col3:
-        gap_25x = (annual_spend_retirement * 25) - current_portfolio
-        st.metric("Gap to 25x", f"${gap_25x:,.0f}", help="Positive number indicates how much more capital is needed to reach 25x.")
 
-    st.caption("These rules of thumb provide a quick readiness check before looking at detailed cashflow modeling.")
-    st.markdown("---")
 
-    # ---------------------------
-    # SECTION 2: CASHFLOW & LONGEVITY MODEL
-    # ---------------------------
-    st.header("2. Cashflow & Longevity Model")
-
+    # Pre-compute the retirement-year row once (used by multiple sections). This must be available
+    # even if the Cashflow & Longevity section is hidden.
     retirement_row = df[df["Age"] == retire_age]
     retirement_row = retirement_row.iloc[0] if not retirement_row.empty else None
 
-    last_row = df.iloc[-1]
-    depletion_rows = df[(df["End Balance"] <= 0) & (df["Age"] > current_age)]
-    depletion_age = int(depletion_rows["Age"].min()) if not depletion_rows.empty else None
+    _show_cashflow = st.checkbox("Show Cashflow & Longevity Model", value=True, key="show_cashflow_section")
+    if _show_cashflow:
+        # ---------------------------
+        # SECTION 2: CASHFLOW & LONGEVITY MODEL
+        # ---------------------------
+        st.header("Cashflow & Longevity Model")
 
-    if retirement_row is not None:
-        assets_at_retirement = float(retirement_row["Portfolio Start"]) if "Portfolio Start" in retirement_row else float(retirement_row["End Balance"])
-        expense_at_retirement = float(retirement_row["Required Spend"])
-    else:
-        assets_at_retirement = 0.0
-        expense_at_retirement = 0.0
+        last_row = df.iloc[-1]
+        depletion_rows = df[(df["End Balance"] <= 0) & (df["Age"] > current_age)]
+        depletion_age = int(depletion_rows["Age"].min()) if not depletion_rows.empty else None
 
-    final_balance = float(last_row["End Balance"])
-
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric(f"Total Assets @ Age {retire_age}", f"${assets_at_retirement:,.0f}")
-    with m2:
-        st.metric(f"Projected Annual Spend @ Age {retire_age}", f"${expense_at_retirement:,.0f}")
-    with m3:
-        st.metric(f"Final Balance @ Age {int(last_row['Age'])}", f"${final_balance:,.0f}")
-    with m4:
-        if depletion_age is not None:
-            st.error(f"Sustainability: Depleted @ Age {depletion_age}")
+        if retirement_row is not None:
+            assets_at_retirement = float(retirement_row["Portfolio Start"]) if "Portfolio Start" in retirement_row else float(retirement_row["End Balance"])
+            expense_at_retirement = float(retirement_row["Required Spend"])
         else:
-            st.success(f"Sustainability: Sustainable to {life_expectancy}")
+            assets_at_retirement = 0.0
+            expense_at_retirement = 0.0
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    if use_multi_asset and all(col in df.columns for col in ["Cash", "Bonds", "ETFs", "401k"]):
-        ax.stackplot(
-            df["Age"],
-            df["Cash"],
-            df["Bonds"],
-            df["ETFs"],
-            df["401k"],
-            labels=["Cash", "Bonds/Munis", "ETFs", "401k"],
-            alpha=0.85,
-        )
-        ax.legend(loc="upper left")
-    else:
-        ax.plot(df["Age"], df["End Balance"], label="Portfolio Balance", linewidth=2)
-        ax.legend(loc="upper right")
+        final_balance = float(last_row["End Balance"])
 
-    ax.axvline(retire_age, linestyle="--", linewidth=1.5, label="Retirement")
-    ax.set_ylabel("Portfolio Value ($)")
-    ax.set_xlabel("Age")
-    st.pyplot(fig)
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric(f"Total Assets @ Age {retire_age}", f"${assets_at_retirement:,.0f}")
+        with m2:
+            st.metric(f"Projected Annual Spend @ Age {retire_age}", f"${expense_at_retirement:,.0f}")
+        with m3:
+            st.metric(f"Final Balance @ Age {int(last_row['Age'])}", f"${final_balance:,.0f}")
+        with m4:
+            if depletion_age is not None:
+                st.error(f"Sustainability: Depleted @ Age {depletion_age}")
+            else:
+                st.success(f"Sustainability: Sustainable to {life_expectancy}")
 
-    if final_balance > 0:
-        st.success(f"At age {life_expectancy}, the projected portfolio balance is **${final_balance:,.0f}**.")
-    else:
-        st.error(f"Portfolio is projected to deplete at age **{depletion_age if depletion_age is not None else 'N/A'}** under current assumptions.")
+        fig, ax = plt.subplots(figsize=(10, 5))
+        if use_multi_asset and all(col in df.columns for col in ["Cash", "Bonds", "ETFs", "401k"]):
+            ax.stackplot(
+                df["Age"],
+                df["Cash"],
+                df["Bonds"],
+                df["ETFs"],
+                df["401k"],
+                labels=["Cash", "Bonds/Munis", "ETFs", "401k"],
+                alpha=0.85,
+            )
+            ax.legend(loc="upper left")
+        else:
+            ax.plot(df["Age"], df["End Balance"], label="Portfolio Balance", linewidth=2)
+            ax.legend(loc="upper right")
 
-    with st.expander("Show yearly projection table"):
-        display_df = df.copy()
-        money_cols = [
-            "Portfolio Start",
-            "Required Spend",
-            "Guaranteed Income",
-            "Portfolio Withdrawal",
-            "End Balance",
-            "Cash",
-            "Bonds",
-            "ETFs",
-            "401k",
-        ]
-        for col in money_cols:
-            if col in display_df.columns:
-                display_df[col] = display_df[col].round(0).astype(int)
+        ax.axvline(retire_age, linestyle="--", linewidth=1.5, label="Retirement")
+        ax.set_ylabel("Portfolio Value ($)")
+        ax.set_xlabel("Age")
+        st.pyplot(fig)
 
-        st.dataframe(display_df, use_container_width=True)
+        if final_balance > 0:
+            st.success(f"At age {life_expectancy}, the projected portfolio balance is **${final_balance:,.0f}**.")
+        else:
+            st.error(f"Portfolio is projected to deplete at age **{depletion_age if depletion_age is not None else 'N/A'}** under current assumptions.")
 
-    st.caption("This projection is deterministic and uses constant return and inflation assumptions. It is a planning tool, not a guarantee.")
+        with st.expander("Show yearly projection table"):
+            display_df = df.copy()
+            money_cols = [
+                "Portfolio Start",
+                "Required Spend",
+                "Guaranteed Income",
+                "Portfolio Withdrawal",
+                "End Balance",
+                "Cash",
+                "Bonds",
+                "ETFs",
+                "401k",
+            ]
+            for col in money_cols:
+                if col in display_df.columns:
+                    display_df[col] = display_df[col].round(0).astype(int)
 
-    # ---------------------------
-    # SECTION 3: 3-BUCKET STRATEGY
-    # ---------------------------
-    st.header("3. The 3-Bucket Strategy Implementation")
-    st.markdown(
-        "Segment the portfolio into time-based buckets to manage **sequence-of-returns risk** "
-        "and support smoother withdrawals."
-    )
+            st.dataframe(display_df, use_container_width=True)
 
-    if current_portfolio > 0 and retirement_row is not None:
-        annual_draw_at_retire = float(retirement_row.get("Portfolio Withdrawal", 0.0))
+        st.caption("This projection is deterministic and uses constant return and inflation assumptions. It is a planning tool, not a guarantee.")
 
-        bucket_1_target = annual_draw_at_retire * 5
-        bucket_2_target = annual_draw_at_retire * 10
 
-        total_assets_for_buckets = float(retirement_row.get("Portfolio Start", retirement_row.get("End Balance", 0.0)))
-        bucket_3_target = max(0.0, total_assets_for_buckets - bucket_1_target - bucket_2_target)
-
-        if current_age < retire_age:
-            bucket_1_target = 0.15 * current_portfolio
-            bucket_2_target = 0.35 * current_portfolio
-            bucket_3_target = 0.50 * current_portfolio
-
-        col_b1, col_b2, col_b3 = st.columns(3)
-        with col_b1:
-            st.subheader("Bucket 1: Cash / Munis")
-            st.markdown("**Role:** Years 1–5 withdrawals")
-            st.info(f"Illustrative Allocation: **${bucket_1_target:,.0f}**")
-            st.caption("Target: High liquidity, low volatility.")
-
-        with col_b2:
-            st.subheader("Bucket 2: Income")
-            st.markdown("**Role:** Years 6–15 withdrawals")
-            st.warning(f"Illustrative Allocation: **${bucket_2_target:,.0f}**")
-            st.caption("Target: Stable income assets.")
-
-        with col_b3:
-            st.subheader("Bucket 3: Growth")
-            st.markdown("**Role:** Year 16+ growth")
-            st.error(f"Illustrative Allocation: **${bucket_3_target:,.0f}**")
-            st.caption("Target: Long-term growth assets.")
-
+    with st.expander("The 3-Bucket Strategy Implementation", expanded=False):
+        # ---------------------------
+        # SECTION 3: 3-BUCKET STRATEGY
+        # ---------------------------
         st.markdown(
-            "In strong markets, **Bucket 3** gains can refill Buckets 1 and 2. "
-            "In weak markets, withdrawals come from Buckets 1 and 2 to avoid forced selling."
-        )
-    else:
-        st.warning("Portfolio value is zero or not set. Adjust inputs in the sidebar to view bucket allocations.")
-
-    st.markdown("---")
-
-    # ---------------------------
-    # SECTION 4: STRESS TEST
-    # ---------------------------
-    st.header("4. Stress Test: Capacity for Loss")
-    st.markdown("Simulate an immediate market shock to understand downside resilience.")
-
-    crash_scenario = st.slider("Simulated Market Drop at Retirement (%)", 0, 50, 20, key="crash_scenario")
-
-    if crash_scenario > 0:
-        stressed_pot = current_portfolio * (1 - (crash_scenario / 100))
-        st.write(f"Portfolio immediately after crash: **${stressed_pot:,.0f}**")
-
-        if stressed_pot > (annual_spend_retirement * 25):
-            st.success(
-                "Even after this shock, the portfolio remains above the standard **25x FIRE** threshold. "
-                "You retain a reasonable margin of safety under current assumptions."
-            )
-        else:
-            st.warning(
-                "This shock brings the portfolio **below** the 25x FIRE threshold. "
-                "You may need to revisit spending, retirement age, or risk assumptions."
-            )
-
-    st.caption("This is a simple single-period stress test. In practice, you would combine this with scenario analysis and more detailed risk modeling.")
-
-    # ---------------------------
-    # SECTION 5: PLAN ANALYSIS & RECOMMENDATIONS (same logic; uses df)
-    # ---------------------------
-    st.markdown("---")
-    st.header("5. Plan Analysis & Recommendations")
-
-    if "analysis_result" not in st.session_state:
-        st.session_state.analysis_result = None
-
-    col_btn, col_help = st.columns([1, 3])
-    with col_btn:
-        analyze_clicked = st.button(
-            "Analyze Sustainability" if st.session_state.analysis_result is None else "Refresh Analysis",
-            key="analyze_button",
-        )
-    with col_help:
-        st.caption(
-            "This analysis uses your current inputs, FIRE targets, tax snapshot, cashflow, "
-            "and portfolio projections to generate a high-level narrative. "
-            "It is not personalized financial advice."
+            "Segment the portfolio into time-based buckets to manage **sequence-of-returns risk** "
+            "and support smoother withdrawals."
         )
 
-    if analyze_clicked:
-        final_balance = float(df.iloc[-1]["End Balance"])
-        ends_positive = final_balance > 0
+        if current_portfolio > 0 and retirement_row is not None:
+            annual_draw_at_retire = float(retirement_row.get("Portfolio Withdrawal", 0.0))
 
-        depletion_age_2 = None
-        if not ends_positive:
-            zero_rows = df[df["End Balance"] == 0]
-            if not zero_rows.empty:
-                depletion_age_2 = int(zero_rows["Age"].min())
+            bucket_1_target = annual_draw_at_retire * 5
+            bucket_2_target = annual_draw_at_retire * 10
 
-        retired_rows = df[df["Age"] >= retire_age]
-        if not retired_rows.empty:
-            first_ret_row = retired_rows.iloc[0]
-            first_withdrawal = float(first_ret_row.get("Portfolio Withdrawal", 0.0))
-            start_base = float(first_ret_row.get("Portfolio Start", first_ret_row.get("End Balance", 0.0)))
-            initial_withdrawal_rate = (first_withdrawal / start_base) if start_base > 0 else 0.0
-        else:
-            first_withdrawal = 0.0
-            initial_withdrawal_rate = 0.0
+            total_assets_for_buckets = float(retirement_row.get("Portfolio Start", retirement_row.get("End Balance", 0.0)))
+            bucket_3_target = max(0.0, total_assets_for_buckets - bucket_1_target - bucket_2_target)
 
-        if ends_positive and initial_withdrawal_rate <= 0.04:
-            sustainability_label = "robust"
-            sustainability_text = (
-                "Based on your assumptions, the plan appears **robust**. "
-                "Your portfolio is projected to last through the full planning horizon, "
-                f"with an ending balance of about **${final_balance:,.0f}** and an initial withdrawal "
-                f"rate of ~{initial_withdrawal_rate * 100:,.1f}%, which is in line with classical 4% guidance."
+            if current_age < retire_age:
+                bucket_1_target = 0.15 * current_portfolio
+                bucket_2_target = 0.35 * current_portfolio
+                bucket_3_target = 0.50 * current_portfolio
+
+            col_b1, col_b2, col_b3 = st.columns(3)
+            with col_b1:
+                st.subheader("Bucket 1: Cash / Munis")
+                st.markdown("**Role:** Years 1–5 withdrawals")
+                st.info(f"Illustrative Allocation: **${bucket_1_target:,.0f}**")
+                st.caption("Target: High liquidity, low volatility.")
+
+            with col_b2:
+                st.subheader("Bucket 2: Income")
+                st.markdown("**Role:** Years 6–15 withdrawals")
+                st.warning(f"Illustrative Allocation: **${bucket_2_target:,.0f}**")
+                st.caption("Target: Stable income assets.")
+
+            with col_b3:
+                st.subheader("Bucket 3: Growth")
+                st.markdown("**Role:** Year 16+ growth")
+                st.error(f"Illustrative Allocation: **${bucket_3_target:,.0f}**")
+                st.caption("Target: Long-term growth assets.")
+
+            st.markdown(
+                "In strong markets, **Bucket 3** gains can refill Buckets 1 and 2. "
+                "In weak markets, withdrawals come from Buckets 1 and 2 to avoid forced selling."
             )
-        elif ends_positive and initial_withdrawal_rate <= 0.05:
-            sustainability_label = "cautious"
-            sustainability_text = (
-                "The plan appears **generally sustainable but somewhat sensitive**. "
-                "Your portfolio is projected to last through the horizon, but the initial withdrawal "
-                f"rate of ~{initial_withdrawal_rate * 100:,.1f}% is above the classic 4% rule. "
-                "Small changes in returns, inflation, or spending could materially impact outcomes."
-            )
         else:
-            sustainability_label = "at risk"
-            if depletion_age_2 is not None:
+            st.warning("Portfolio value is zero or not set. Adjust inputs in the sidebar to view bucket allocations.")
+
+        st.markdown("---")
+
+        # ---------------------------
+
+    _show_plan_analysis = st.checkbox("Show 8. Plan Analysis & Recommendations", value=True, key="show_plan_analysis_section")
+    if _show_plan_analysis:
+        # ---------------------------
+        # SECTION 5: PLAN ANALYSIS & RECOMMENDATIONS (same logic; uses df)
+        # ---------------------------
+        st.markdown("---")
+        st.header("Plan Analysis & Recommendations")
+
+        if "analysis_result" not in st.session_state:
+            st.session_state.analysis_result = None
+
+        col_btn, col_help = st.columns([1, 3])
+        with col_btn:
+            analyze_clicked = st.button(
+                "Analyze Sustainability" if st.session_state.analysis_result is None else "Refresh Analysis",
+                key="analyze_button",
+            )
+        with col_help:
+            st.caption(
+                "This analysis uses your current inputs, FIRE targets, tax snapshot, cashflow, "
+                "and portfolio projections to generate a high-level narrative. "
+                "It is not personalized financial advice."
+            )
+
+        if analyze_clicked:
+            final_balance = float(df.iloc[-1]["End Balance"])
+            ends_positive = final_balance > 0
+
+            depletion_age_2 = None
+            if not ends_positive:
+                zero_rows = df[df["End Balance"] == 0]
+                if not zero_rows.empty:
+                    depletion_age_2 = int(zero_rows["Age"].min())
+
+            retired_rows = df[df["Age"] >= retire_age]
+            if not retired_rows.empty:
+                first_ret_row = retired_rows.iloc[0]
+                first_withdrawal = float(first_ret_row.get("Portfolio Withdrawal", 0.0))
+                start_base = float(first_ret_row.get("Portfolio Start", first_ret_row.get("End Balance", 0.0)))
+                initial_withdrawal_rate = (first_withdrawal / start_base) if start_base > 0 else 0.0
+            else:
+                first_withdrawal = 0.0
+                initial_withdrawal_rate = 0.0
+
+            if ends_positive and initial_withdrawal_rate <= 0.04:
+                sustainability_label = "robust"
                 sustainability_text = (
-                    "The plan appears **at risk of depletion** under current assumptions. "
-                    f"Your portfolio is projected to run out around age **{depletion_age_2}**, "
-                    "suggesting that retirement timing, spending levels, or risk assumptions may need revision."
+                    "Based on your assumptions, the plan appears **robust**. "
+                    "Your portfolio is projected to last through the full planning horizon, "
+                    f"with an ending balance of about **${final_balance:,.0f}** and an initial withdrawal "
+                    f"rate of ~{initial_withdrawal_rate * 100:,.1f}%, which is in line with classical 4% guidance."
+                )
+            elif ends_positive and initial_withdrawal_rate <= 0.05:
+                sustainability_label = "cautious"
+                sustainability_text = (
+                    "The plan appears **generally sustainable but somewhat sensitive**. "
+                    "Your portfolio is projected to last through the horizon, but the initial withdrawal "
+                    f"rate of ~{initial_withdrawal_rate * 100:,.1f}% is above the classic 4% rule. "
+                    "Small changes in returns, inflation, or spending could materially impact outcomes."
                 )
             else:
-                sustainability_text = (
-                    "The plan appears **at risk** under current assumptions. "
-                    "Projected withdrawals and/or return assumptions lead to low ending balances and "
-                    "a narrow margin for error."
-                )
+                sustainability_label = "at risk"
+                if depletion_age_2 is not None:
+                    sustainability_text = (
+                        "The plan appears **at risk of depletion** under current assumptions. "
+                        f"Your portfolio is projected to run out around age **{depletion_age_2}**, "
+                        "suggesting that retirement timing, spending levels, or risk assumptions may need revision."
+                    )
+                else:
+                    sustainability_text = (
+                        "The plan appears **at risk** under current assumptions. "
+                        "Projected withdrawals and/or return assumptions lead to low ending balances and "
+                        "a narrow margin for error."
+                    )
 
-        summary_text = (
-            f"You are currently **{current_age}**, planning to retire at **{retire_age}**, with an initial "
-            f"retirement spending target of **${annual_spend_retirement:,.0f}** per year (in today's dollars). "
-            f"Current investable assets are **${current_portfolio:,.0f}**, with assumed pre-retirement growth of "
-            f"**{pre_retire_return * 100:,.1f}%**, post-retirement growth of **{post_retire_return * 100:,.1f}%**, "
-            f"and inflation of **{inflation_rate * 100:,.1f}%**. "
-            f"Your current tax-effective net income is about **${net_take_home:,.0f}**, with estimated annual "
-            f"expenses of **${annual_expenses:,.0f}**, leaving a surplus of approximately "
-            f"**${surplus:,.0f}** available for savings and flexibility."
-        )
-
-        recommendations = []
-        target_25x = annual_spend_retirement * 25
-        target_33x = annual_spend_retirement * 33
-
-        if current_portfolio < target_25x:
-            recommendations.append(
-                f"Increase annual savings and/or redirect more of your current surplus toward investing. "
-                f"Your current portfolio (~${current_portfolio:,.0f}) is below the 25x target (~${target_25x:,.0f})."
-            )
-        if current_portfolio < target_33x:
-            recommendations.append(
-                "Consider a more conservative FIRE target closer to **33x annual spending** if you want higher "
-                "confidence in long-term sustainability, especially with longer life expectancy assumptions."
+            summary_text = (
+                f"You are currently **{current_age}**, planning to retire at **{retire_age}**, with an initial "
+                f"retirement spending target of **${annual_spend_retirement:,.0f}** per year (in today's dollars). "
+                f"Current investable assets are **${current_portfolio:,.0f}**, with assumed pre-retirement growth of "
+                f"**{pre_retire_return * 100:,.1f}%**, post-retirement growth of **{post_retire_return * 100:,.1f}%**, "
+                f"and inflation of **{inflation_rate * 100:,.1f}%**. "
+                f"Your current tax-effective net income is about **${net_take_home:,.0f}**, with estimated annual "
+                f"expenses of **${annual_expenses:,.0f}**, leaving a surplus of approximately "
+                f"**${surplus:,.0f}** available for savings and flexibility."
             )
 
-        if surplus < 0:
-            recommendations.append(
-                "Your current annual expenses appear to **exceed** your after-tax income, creating a structural deficit. "
-                "Addressing this gap (through spending reductions or income increases) should be a priority before "
-                "relying on aggressive retirement contributions."
-            )
-        elif annual_contribution > surplus:
-            recommendations.append(
-                f"Planned annual contributions of **${annual_contribution:,.0f}** exceed the current estimated "
-                f"surplus of **${surplus:,.0f}**. Validate that this contribution rate is realistic and sustainable "
-                "given your lifestyle and cashflow needs."
-            )
+            recommendations = []
+            target_25x = annual_spend_retirement * 25
+            target_33x = annual_spend_retirement * 33
 
-        if sustainability_label in ["cautious", "at risk"]:
-            recommendations.append(
-                "Evaluate retiring **later by 2–3 years** or modestly lowering initial retirement spending "
-                "to improve the portfolio's ability to withstand return and inflation shocks."
-            )
-            recommendations.append(
-                "Review your asset allocation across cash, bonds, and equities to ensure it aligns with both "
-                "your risk tolerance and the need for growth to support a long retirement horizon."
-            )
-
-        if effective_tax_rate > 0.30:
-            recommendations.append(
-                "Explore **tax optimization strategies** (e.g., maxing tax-advantaged accounts, Roth conversions, "
-                "capital gains harvesting, or efficient asset location) to improve net-of-tax returns over time."
-            )
-
-        if crash_scenario > 0:
-            stressed_pot = current_portfolio * (1 - (crash_scenario / 100))
-            if stressed_pot < target_25x:
+            if current_portfolio < target_25x:
                 recommendations.append(
-                    f"Under a {crash_scenario}% immediate market shock, investable assets fall to "
-                    f"~${stressed_pot:,.0f}, below the 25x spending target. Consider holding a somewhat "
-                    "larger safety bucket in cash/bonds or scaling back risk slightly pre-retirement."
+                    f"Increase annual savings and/or redirect more of your current surplus toward investing. "
+                    f"Your current portfolio (~${current_portfolio:,.0f}) is below the 25x target (~${target_25x:,.0f})."
+                )
+            if current_portfolio < target_33x:
+                recommendations.append(
+                    "Consider a more conservative FIRE target closer to **33x annual spending** if you want higher "
+                    "confidence in long-term sustainability, especially with longer life expectancy assumptions."
                 )
 
-        if sustainability_label == "robust":
-            risk_assessment = (
-                "Overall portfolio risk appears **aligned** with your objectives, assuming your stated return and "
-                "inflation assumptions are realistic. The main residual risks are sequence-of-returns risk in the early "
-                "retirement years and potential regime shifts in inflation or tax policy."
-            )
-        elif sustainability_label == "cautious":
-            risk_assessment = (
-                "Portfolio risk appears **moderately elevated** relative to your withdrawal targets. "
-                "You likely need meaningful exposure to growth assets to make the plan work, which increases sensitivity "
-                "to market drawdowns, especially in the first 5–10 years of retirement."
-            )
-        else:
-            risk_assessment = (
-                "Portfolio risk and spending assumptions appear **misaligned**. At current spending levels, the plan "
-                "relies on favorable markets and leaves limited margin for adverse sequences of returns or higher-than-"
-                "expected inflation. De-risking without adjusting spending or timing would further compress sustainability."
-            )
+            if surplus < 0:
+                recommendations.append(
+                    "Your current annual expenses appear to **exceed** your after-tax income, creating a structural deficit. "
+                    "Addressing this gap (through spending reductions or income increases) should be a priority before "
+                    "relying on aggressive retirement contributions."
+                )
+            elif annual_contribution > surplus:
+                recommendations.append(
+                    f"Planned annual contributions of **${annual_contribution:,.0f}** exceed the current estimated "
+                    f"surplus of **${surplus:,.0f}**. Validate that this contribution rate is realistic and sustainable "
+                    "given your lifestyle and cashflow needs."
+                )
 
-        st.session_state.analysis_result = {
-            "summary": summary_text,
-            "sustainability_check": sustainability_text,
-            "recommendations": recommendations,
-            "risk_assessment": risk_assessment,
-        }
+            if sustainability_label in ["cautious", "at risk"]:
+                recommendations.append(
+                    "Evaluate retiring **later by 2–3 years** or modestly lowering initial retirement spending "
+                    "to improve the portfolio's ability to withstand return and inflation shocks."
+                )
+                recommendations.append(
+                    "Review your asset allocation across cash, bonds, and equities to ensure it aligns with both "
+                    "your risk tolerance and the need for growth to support a long retirement horizon."
+                )
 
-    result = st.session_state.analysis_result
-    if result is None:
-        st.info("Configure your assumptions and inputs above, then click **Analyze Sustainability** to generate a narrative assessment of your plan.")
-    else:
-        st.subheader("Plan Narrative")
+            if effective_tax_rate > 0.30:
+                recommendations.append(
+                    "Explore **tax optimization strategies** (e.g., maxing tax-advantaged accounts, Roth conversions, "
+                    "capital gains harvesting, or efficient asset location) to improve net-of-tax returns over time."
+                )
 
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            st.markdown("#### Executive Summary")
-            st.markdown(result["summary"])
-        with col_s2:
-            st.markdown("#### Sustainability Check")
-            st.markdown(result["sustainability_check"])
+            if crash_scenario > 0:
+                stressed_pot = current_portfolio * (1 - (crash_scenario / 100))
+                if stressed_pot < target_25x:
+                    recommendations.append(
+                        f"Under a {crash_scenario}% immediate market shock, investable assets fall to "
+                        f"~${stressed_pot:,.0f}, below the 25x spending target. Consider holding a somewhat "
+                        "larger safety bucket in cash/bonds or scaling back risk slightly pre-retirement."
+                    )
 
-        st.markdown("")
-        col_r1, col_r2 = st.columns(2)
-        with col_r1:
-            st.markdown("#### Tactical Recommendations")
-            if result["recommendations"]:
-                for idx, rec in enumerate(result["recommendations"], start=1):
-                    st.markdown(f"**{idx}.** {rec}")
+            if sustainability_label == "robust":
+                risk_assessment = (
+                    "Overall portfolio risk appears **aligned** with your objectives, assuming your stated return and "
+                    "inflation assumptions are realistic. The main residual risks are sequence-of-returns risk in the early "
+                    "retirement years and potential regime shifts in inflation or tax policy."
+                )
+            elif sustainability_label == "cautious":
+                risk_assessment = (
+                    "Portfolio risk appears **moderately elevated** relative to your withdrawal targets. "
+                    "You likely need meaningful exposure to growth assets to make the plan work, which increases sensitivity "
+                    "to market drawdowns, especially in the first 5–10 years of retirement."
+                )
             else:
-                st.markdown("No specific tactical changes are flagged by the current rule set. Monitor the plan periodically and revisit assumptions as life circumstances change.")
-        with col_r2:
-            st.markdown("#### Portfolio Risk Assessment")
-            st.markdown(result["risk_assessment"])
+                risk_assessment = (
+                    "Portfolio risk and spending assumptions appear **misaligned**. At current spending levels, the plan "
+                    "relies on favorable markets and leaves limited margin for adverse sequences of returns or higher-than-"
+                    "expected inflation. De-risking without adjusting spending or timing would further compress sustainability."
+                )
 
-    # =============================================================================
-    # TAB 2: COMPARE SCENARIOS
-    # =============================================================================
+            st.session_state.analysis_result = {
+                "summary": summary_text,
+                "sustainability_check": sustainability_text,
+                "recommendations": recommendations,
+                "risk_assessment": risk_assessment,
+            }
+
+        result = st.session_state.analysis_result
+        if result is None:
+            st.info("Configure your assumptions and inputs above, then click **Analyze Sustainability** to generate a narrative assessment of your plan.")
+        else:
+            st.subheader("Plan Narrative")
+
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                st.markdown("#### Executive Summary")
+                st.markdown(result["summary"])
+            with col_s2:
+                st.markdown("#### Sustainability Check")
+                st.markdown(result["sustainability_check"])
+
+            st.markdown("")
+            col_r1, col_r2 = st.columns(2)
+            with col_r1:
+                st.markdown("#### Tactical Recommendations")
+                if result["recommendations"]:
+                    for idx, rec in enumerate(result["recommendations"], start=1):
+                        st.markdown(f"**{idx}.** {rec}")
+                else:
+                    st.markdown("No specific tactical changes are flagged by the current rule set. Monitor the plan periodically and revisit assumptions as life circumstances change.")
+            with col_r2:
+                st.markdown("#### Portfolio Risk Assessment")
+                st.markdown(result["risk_assessment"])
+
+        # =============================================================================
+        # TAB 2: COMPARE SCENARIOS
+        # =============================================================================
+
 with tab2:
     st.subheader("Scenario Comparison (Side-by-Side)")
 
