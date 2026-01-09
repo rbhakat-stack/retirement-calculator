@@ -1813,6 +1813,123 @@ def scenario_kpis(df: pd.DataFrame, retire_age: int, current_age: int, life_expe
 # ---------------------------------------------------------------------------
 # MONTE CARLO SIMULATION (OPT-IN; DOES NOT CHANGE DETERMINISTIC BEHAVIOR)
 # ---------------------------------------------------------------------------
+
+def retirement_confidence_score(df: pd.DataFrame, retire_age: int, current_age: int, life_expectancy: int) -> dict:
+    """Heuristic 0–100 'confidence' score for a deterministic scenario.
+
+    This is intentionally simple and explainable. It does NOT replace Monte Carlo.
+    Inputs:
+      - df: output of run_projection_from_snapshot (single scenario)
+      - retire_age/current_age/life_expectancy: ages used for the scenario
+    Returns:
+      {score:int, label:str, notes:list[str], components:dict}
+    """
+    score = 100.0
+    notes: list[str] = []
+    components: dict = {}
+
+    try:
+        # Assets at retirement (start of retirement year if available)
+        retire_row = df[df["Age"] == retire_age]
+        retire_row = retire_row.iloc[0] if not retire_row.empty else None
+
+        assets_at_retirement = 0.0
+        if retire_row is not None:
+            if "Portfolio Start" in retire_row:
+                assets_at_retirement = float(retire_row["Portfolio Start"])
+            else:
+                assets_at_retirement = float(retire_row.get("End Balance", 0.0))
+        components["assets_at_retirement"] = assets_at_retirement
+
+        # Final balance at horizon
+        last_row = df.iloc[-1]
+        final_balance = float(last_row.get("End Balance", 0.0))
+        components["final_balance"] = final_balance
+
+        # Depletion age (if any)
+        depletion_rows = df[(df.get("End Balance", 0) <= 0) & (df["Age"] > current_age)]
+        depletion_age = int(depletion_rows["Age"].min()) if not depletion_rows.empty else None
+        components["depletion_age"] = depletion_age
+
+        # Withdrawal rate in the first retirement year (if available)
+        wr = 0.0
+        retired_rows = df[df["Age"] >= retire_age]
+        if not retired_rows.empty:
+            first_ret = retired_rows.iloc[0]
+            withdrawal = float(first_ret.get("Portfolio Withdrawal", 0.0))
+            base = float(first_ret.get("Portfolio Start", first_ret.get("End Balance", 0.0)))
+            wr = (withdrawal / base) if base > 0 else 0.0
+        components["withdrawal_rate"] = wr
+
+        # -------------------------
+        # Component 1: Sustainability to life expectancy (largest weight)
+        # -------------------------
+        if depletion_age is not None and depletion_age <= life_expectancy:
+            years_short = max(0, int(life_expectancy - depletion_age + 1))
+            # Strong penalty if the plan fails before horizon
+            pen = min(85.0, years_short * 6.0)
+            score -= pen
+            notes.append(f"Plan depletes at age {depletion_age} (about {years_short} year(s) short of age {life_expectancy}).")
+        else:
+            notes.append(f"Plan sustains through age {life_expectancy} (no depletion projected).")
+
+        # -------------------------
+        # Component 2: First-year retirement withdrawal rate vs a 4% baseline
+        # -------------------------
+        # Baseline: 4% is 'typical' rule-of-thumb; <3.5% is conservative.
+        if wr <= 0.035:
+            score += 5.0
+            notes.append(f"Withdrawal rate looks conservative (~{wr*100:.2f}% in first retirement year).")
+        elif wr <= 0.045:
+            notes.append(f"Withdrawal rate is near common baselines (~{wr*100:.2f}% in first retirement year).")
+        else:
+            pen = min(25.0, (wr - 0.045) * 500.0)  # ~5.5% => 5 pts; 7% => 12.5 pts
+            score -= pen
+            notes.append(f"Withdrawal rate is elevated (~{wr*100:.2f}% in first retirement year).")
+
+        # -------------------------
+        # Component 3: Ending balance buffer (relative to assets at retirement)
+        # -------------------------
+        if assets_at_retirement > 0:
+            ratio = final_balance / assets_at_retirement
+            components["ending_buffer_ratio"] = ratio
+
+            if ratio <= 0.10:
+                score -= 20.0
+                notes.append("Ending balance buffer is thin (ending assets are <10% of assets at retirement).")
+            elif ratio <= 0.25:
+                score -= 12.0
+                notes.append("Ending balance buffer is modest (ending assets are 10–25% of assets at retirement).")
+            elif ratio >= 1.25:
+                score += 5.0
+                notes.append("Strong ending buffer (ending assets exceed assets at retirement).")
+
+        # clamp
+        score = max(0.0, min(100.0, score))
+
+    except Exception:
+        # Never break the app; provide a graceful fallback.
+        score = 50.0
+        notes = ["Unable to compute score due to an unexpected data issue."]
+
+    # Labeling
+    if score >= 80:
+        label = "Strong"
+    elif score >= 60:
+        label = "Moderate"
+    elif score >= 40:
+        label = "At Risk"
+    else:
+        label = "Critical"
+
+    return {
+        "score": int(round(score)),
+        "label": label,
+        "notes": notes,
+        "components": components,
+    }
+
+
 def _sim_return_draw(rng: np.random.Generator, mu: float, sigma: float, size: int) -> np.ndarray:
     """
     Draw arithmetic returns with a simple guardrail so we never go below -100%.
@@ -2350,6 +2467,35 @@ with tab1:
             portfolio = end_bal
 
         df = pd.DataFrame(data)
+
+
+    # ---------------------------
+    # FOUNDATIONAL: Retirement Confidence Score (heuristic)
+    # ---------------------------
+    try:
+        _rcs = retirement_confidence_score(df, retire_age=retire_age, current_age=current_age, life_expectancy=life_expectancy)
+        _score = int(_rcs.get("score", 0))
+        _label = str(_rcs.get("label", ""))
+        _notes = _rcs.get("notes", []) or []
+
+        st.subheader("Retirement Confidence Score")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.metric("Score (0–100)", f"{_score}", help="A simple, explainable heuristic based on sustainability to your planning horizon, withdrawal pressure, and ending-balance buffer. For probabilistic confidence, use Monte Carlo.")
+            st.progress(_score / 100.0)
+            st.caption(f"Status: {_label}")
+        with c2:
+            if isinstance(_notes, (list, tuple)) and _notes:
+                st.markdown("**Key drivers**")
+                for _n in _notes[:4]:
+                    st.write(f"• {_n}")
+            else:
+                st.write("")
+
+        st.markdown("---")
+    except Exception:
+        # Never break existing rendering
+        pass
 
     # ---------------------------
     # SECTION 1: FIRE OVERVIEW
