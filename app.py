@@ -1,3 +1,5 @@
+import json
+import textwrap
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -92,6 +94,7 @@ from reportlab.lib import colors as _rl_colors
 _PDF_BRAND = {
     "primary": _rl_colors.HexColor("#0B2D4D"),   # deep navy
     "accent":  _rl_colors.HexColor("#1F77B4"),   # blue accent
+    "text":    _rl_colors.HexColor("#111827"),   # near-black
     "muted":   _rl_colors.HexColor("#6B7280"),   # gray
     "light":   _rl_colors.HexColor("#F3F4F6"),   # light gray background
     "border":  _rl_colors.HexColor("#E5E7EB"),   # table borders
@@ -99,7 +102,6 @@ _PDF_BRAND = {
     "warn":    _rl_colors.HexColor("#B45309"),   # amber
     "bad":     _rl_colors.HexColor("#B91C1C"),   # red
 }
-
 def _pdf_header(c: canvas.Canvas, W: float, H: float, title: str, subtitle_left: str, subtitle_right: str) -> None:
     """Draws a branded header band."""
     band_h = 0.75 * inch
@@ -133,6 +135,30 @@ def _pdf_footer(c: canvas.Canvas, W: float, H: float, page_num: int) -> None:
     c.drawRightString(W - 0.75 * inch, 0.55 * inch, f"Page {page_num}")
     c.restoreState()
 
+
+def _pdf_title_block(c, title: str, subtitle: str, y: float, W: float, margin: float) -> float:
+    """Title block for PDF reports (clean, non-overlapping). Returns updated y."""
+    c.saveState()
+
+    c.setFont("Helvetica-Bold", 22)
+    c.setFillColor(_PDF_BRAND["text"])
+    c.drawString(margin, y, title)
+
+    y -= 22
+    c.setFont("Helvetica", 10)
+    c.setFillColor(_PDF_BRAND["muted"])
+    c.drawString(margin, y, subtitle)
+
+    gen = datetime.now().strftime("%b %d, %Y %I:%M %p")
+    c.drawRightString(W - margin, y, f"Generated: {gen}")
+
+    y -= 14
+    c.setStrokeColor(_PDF_BRAND["border"])
+    c.setLineWidth(1)
+    c.line(margin, y, W - margin, y)
+
+    c.restoreState()
+    return y - 14
 def _pdf_section_title(c: canvas.Canvas, x: float, y: float, W: float, text: str) -> float:
     c.saveState()
     c.setFillColor(_PDF_BRAND["light"])
@@ -294,7 +320,14 @@ def _pdf_draw_table(c: canvas.Canvas, x: float, y: float, W: float, df: pd.DataF
 
 
 
-def _build_montecarlo_pdf_bytes(user_id: str, snap: dict, sim_settings: dict, res: dict, chart_png: bytes | None) -> bytes:
+def _build_montecarlo_pdf_bytes(
+    user_id: str,
+    snap: dict,
+    sim_settings: dict,
+    res: dict,
+    chart_png: bytes | None,
+    report_payload: dict | None = None,
+) -> bytes:
     """
     Build a Monte Carlo PDF report (professional layout).
     - snap: normalized inputs snapshot (same structure used by the simulator)
@@ -377,7 +410,103 @@ def _build_montecarlo_pdf_bytes(user_id: str, snap: dict, sim_settings: dict, re
             y = _start_page()
         y = _pdf_kpi_cards(c, x, y, usable_w, kpi_cards[4:8])
 
-    # Narrative bullets
+    
+    # Additional sections (captured from other tabs)
+    rp = report_payload or {}
+
+    cmp = rp.get("compare")
+    if cmp and cmp.get("scenarios"):
+        y = _pdf_section_title(c, "Compare Scenarios (Summary)", margin, y)
+        rows = [["Scenario", "Confidence", "Sustainable Spend", "Retirement Start"]]
+        for s in cmp.get("scenarios", []):
+            rows.append([s.get("name",""), str(s.get("confidence","")), str(s.get("sustainable_spend","")), str(s.get("retirement_age",""))])
+        y = _pdf_table(c, rows, x=margin, y=y, W=W - 2 * margin, col_widths=[0.34*(W-2*margin),0.22*(W-2*margin),0.22*(W-2*margin),0.22*(W-2*margin)])
+    else:
+        c.setFont('Helvetica', 10)
+        c.setFillColor(_PDF_BRAND['primary'])
+        c.drawString(margin, y, 'Compare Scenarios: not run in this session.')
+        y -= 14
+
+    rng = rp.get("range_outcomes")
+    if rng and rng.get("metrics"):
+        y = _pdf_section_title(c, "Range of Outcomes (Selected Percentiles)", margin, y)
+        rows = [["Metric", "P10", "P50", "P90"]]
+        for mname, vals in rng.get("metrics", {}).items():
+            rows.append([mname, str(vals.get("p10","")), str(vals.get("p50","")), str(vals.get("p90",""))])
+        y = _pdf_table(c, rows, x=margin, y=y, W=W - 2 * margin, col_widths=[0.40*(W-2*margin),0.20*(W-2*margin),0.20*(W-2*margin),0.20*(W-2*margin)])
+    else:
+        c.setFont('Helvetica', 10)
+        c.setFillColor(_PDF_BRAND['primary'])
+        c.drawString(margin, y, 'Range of Outcomes: not run in this session.')
+        y -= 14
+
+    # "How much can I spend in retirement?" (Single Scenario)
+    try:
+        spend_results = st.session_state.get("spend_calc_results") or rp.get("spend_calc_results")
+        if spend_results:
+            y = _pdf_section_title(c, "How much can I spend in retirement?", margin, y)
+            rows = [["Confidence target", "Estimated sustainable annual spend (today's $)"]]
+            for label, out in spend_results[:3]:
+                spend_val = 0.0
+                try:
+                    spend_val = float((out or {}).get("spend", 0.0))
+                except Exception:
+                    spend_val = 0.0
+                rows.append([str(label), _money(spend_val)])
+            y = _pdf_table(
+                c,
+                rows,
+                x=margin,
+                y=y,
+                W=W - 2 * margin,
+                col_widths=[0.45 * (W - 2 * margin), 0.55 * (W - 2 * margin)],
+                font_size=9,
+            )
+            y -= 6
+    except Exception:
+        pass
+
+    stx = rp.get("stress_tests") or {}
+    y = _pdf_section_title(c, "Market Reality Mode (Stress Tests)", margin, y)
+
+    try:
+        st_rows = stx.get("rows") or []
+        if st_rows:
+            rows = [["Shock", "Confidence Δ", "Spend impact", "Recovery time"]]
+            for r in st_rows:
+                rows.append([
+                    str(r.get("shock", "")),
+                    str(r.get("confidence_delta", r.get("confidence_delta_pct", ""))),
+                    str(r.get("spend_impact", "")),
+                    str(r.get("recovery_time", "")),
+                ])
+            y = _pdf_table(
+                c,
+                rows,
+                x=margin,
+                y=y,
+                W=W - 2 * margin,
+                col_widths=[
+                    0.42 * (W - 2 * margin),
+                    0.19 * (W - 2 * margin),
+                    0.19 * (W - 2 * margin),
+                    0.20 * (W - 2 * margin),
+                ],
+                font_size=9,
+            )
+            y -= 6
+        else:
+            c.setFont("Helvetica", 10)
+            c.setFillColor(_PDF_BRAND["muted"])
+            c.drawString(margin, y, "No stress tests were run for this report.")
+            y -= 14
+    except Exception:
+        c.setFont("Helvetica", 10)
+        c.setFillColor(_PDF_BRAND["muted"])
+        c.drawString(margin, y, "Stress test summary unavailable due to an internal error.")
+        y -= 14
+
+# Narrative bullets
     if y < 2.0 * inch:
         _end_page()
         y = _start_page()
@@ -667,6 +796,376 @@ def _build_compare_pdf_bytes(user_id: str, kpi_df: pd.DataFrame, chart_png: byte
         y = y - img_h - 10
 
     _pdf_footer(c, W, H, page_num)
+    c.save()
+    return buf.getvalue()
+
+
+def _pdf_section_title(c, *args):
+    """Draw a section title and return updated y.
+
+    Supports both call styles used across the app:
+
+      1) _pdf_section_title(c, text, margin, y)
+      2) _pdf_section_title(c, margin, y, text)
+      3) _pdf_section_title(c, x, y, W, text)
+      4) _pdf_section_title(c, text, x, y, W)
+
+    Returns the updated y cursor.
+    """
+    # Normalize arguments
+    if len(args) == 3:
+        a1, a2, a3 = args
+        if isinstance(a1, str) and isinstance(a2, (int, float)) and isinstance(a3, (int, float)):
+            text, x, y = a1, float(a2), float(a3)
+        elif isinstance(a3, str) and isinstance(a1, (int, float)) and isinstance(a2, (int, float)):
+            x, y, text = float(a1), float(a2), a3
+        else:
+            # best-effort
+            text, x, y = str(a1), float(a2), float(a3)
+        # Simple title (no width banner)
+        try:
+            c.setFont("Helvetica-Bold", 12)
+        except Exception:
+            pass
+        c.drawString(x, y, str(text))
+        y -= 16
+        try:
+            c.setLineWidth(0.5)
+            page_w = getattr(c, "_pagesize", (595.0, 842.0))[0]
+            c.line(x, y + 6, page_w - x, y + 6)
+        except Exception:
+            pass
+        return y
+
+    if len(args) == 4:
+        a1, a2, a3, a4 = args
+        # Identify ordering
+        if isinstance(a4, str) and all(isinstance(v, (int, float)) for v in (a1, a2, a3)):
+            x, y, W, text = float(a1), float(a2), float(a3), a4
+        elif isinstance(a1, str) and all(isinstance(v, (int, float)) for v in (a2, a3, a4)):
+            text, x, y, W = a1, float(a2), float(a3), float(a4)
+        else:
+            # best-effort fallback
+            x, y, W, text = float(a1), float(a2), float(a3), str(a4)
+
+        # Banner style if brand palette exists; otherwise plain.
+        try:
+            brand = globals().get("_PDF_BRAND") or globals().get("PDF_BRAND") or {}
+            primary = brand.get("primary")
+            light = brand.get("light")
+            if light is not None and primary is not None:
+                from reportlab.lib import colors
+                c.saveState()
+                c.setFillColor(light if hasattr(light, "__class__") else colors.HexColor(str(light)))
+                c.roundRect(x, y - 16, W, 18, 6, stroke=0, fill=1)
+                c.setFillColor(primary if hasattr(primary, "__class__") else colors.HexColor(str(primary)))
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(x + 8, y - 12, str(text))
+                c.restoreState()
+                return y - 26
+        except Exception:
+            pass
+
+        # Fallback rendering
+        try:
+            c.setFont("Helvetica-Bold", 12)
+        except Exception:
+            pass
+        c.drawString(x, y, str(text))
+        y -= 16
+        try:
+            c.setLineWidth(0.5)
+            c.line(x, y + 6, x + W, y + 6)
+        except Exception:
+            pass
+        return y - 6
+
+    raise TypeError(f"_pdf_section_title expected 3 or 4 arguments after canvas, got {len(args)}")
+def _pdf_table(c, rows, x, y, W, col_widths=None, font_name="Helvetica", font_size=9, row_pad=6):
+    """
+    Render a readable, non-overlapping table onto a ReportLab canvas.
+
+    - Increased padding to prevent text touching borders.
+    - Header row fill + bold font.
+    - Subtle zebra striping for readability.
+    """
+    if not rows:
+        return y
+
+    rows = [["" if v is None else str(v) for v in r] for r in rows]
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+
+    if col_widths is None:
+        col_widths = [W / ncols] * ncols
+    else:
+        s = sum(col_widths) or 1.0
+        if abs(s - W) > 1e-6:
+            col_widths = [w * (W / s) for w in col_widths]
+
+    page_w, page_h = getattr(c, "_pagesize", (595.0, 842.0))
+
+    # Approx chars per line for wrapping
+    chars = []
+    for w in col_widths:
+        cpl = max(10, int(w / (font_size * 0.55)))
+        chars.append(cpl)
+
+    import textwrap as _tw
+    def wrap_cell(val: str, cpl: int):
+        s = (val or "").replace("\r", "")
+        parts = []
+        for para in str(s).split("\n"):
+            parts.extend(_tw.wrap(para, width=cpl) or [""])
+        return parts or [""]
+
+    wrapped = []
+    heights = []
+    leading = font_size + 3
+
+    for r in rows:
+        wr = [wrap_cell(r[i], chars[i]) for i in range(ncols)]
+        wrapped.append(wr)
+        max_lines = max(len(w) for w in wr)
+        heights.append(max(leading + 2 * row_pad, max_lines * leading + 2 * row_pad))
+
+    cur_y = y
+    inset_x = 6
+
+    for ridx in range(len(rows)):
+        h = heights[ridx]
+        if cur_y - h < 40:
+            c.showPage()
+            cur_y = page_h - 60
+
+        # Row background fills
+        if ridx == 0:
+            c.saveState()
+            c.setFillColor(_PDF_BRAND["light"])
+            c.rect(x, cur_y - h, W, h, stroke=0, fill=1)
+            c.restoreState()
+        elif ridx % 2 == 0:
+            c.saveState()
+            c.setFillColor(_rl_colors.whitesmoke)
+            c.rect(x, cur_y - h, W, h, stroke=0, fill=1)
+            c.restoreState()
+
+        cx = x
+        for cidx in range(ncols):
+            c.rect(cx, cur_y - h, col_widths[cidx], h, stroke=1, fill=0)
+
+            if ridx == 0:
+                c.setFont("Helvetica-Bold", font_size)
+            else:
+                c.setFont(font_name, font_size)
+
+            ty = cur_y - row_pad - font_size
+            for ln in wrapped[ridx][cidx]:
+                c.drawString(cx + inset_x, ty, ln[:300])
+                ty -= leading
+            cx += col_widths[cidx]
+
+        cur_y -= h
+
+    return cur_y - 12
+
+
+def _build_readiness_report_pdf_bytes(
+    user_id: str,
+    snap: dict,
+    baseline_res: dict,
+    stress_rows: list[dict],
+    narrative: dict,
+    report_payload: dict | None = None,
+) -> bytes:
+    """Build a one-time Retirement Readiness Report (Phase 2).
+
+    This is an interpretation/reporting layer only. It does not provide prescriptive advice.
+    """
+    # Optional extended payload for premium report sections (compare/range/stress summaries)
+    rp = report_payload or {}
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    W, H = letter
+    margin = 0.75 * inch
+
+    # Cover / Title
+    y = H - margin
+    _pdf_title_block(
+        c,
+        title="One-Time Retirement Readiness Report",
+        subtitle=f"Generated for: {user_id}",
+        y=y,
+        W=W,
+        margin=margin,
+    )
+    y -= 48
+
+
+    # Inputs summary (Single Scenario)
+    # Inputs summary (Single Scenario)
+    try:
+        y = _pdf_section_title(c, "Single Scenario Inputs (Summary)", margin, y)
+
+        cur_age = int(snap.get("current_age", 0) or 0)
+        ret_age = int(snap.get("retire_age", snap.get("retire_age", snap.get("retire_age", 0))) or snap.get("retire_age", 0) or 0)
+        # The canonical snapshot uses "retire_age" in the UI and "retire_age"/"retire_age" may not exist; also accept "retire_age"
+        if not ret_age:
+            ret_age = int(snap.get("retire_age", snap.get("retire_age", 0)) or 0)
+        if not ret_age:
+            ret_age = int(snap.get("retire_age", 0) or 0)
+        if not ret_age:
+            ret_age = int(snap.get("retire_age", 0) or 0)
+        if not ret_age:
+            ret_age = int(snap.get("retire_age", 0) or 0)
+
+        # In this app the canonical key is "retire_age"
+        ret_age = int(snap.get("retire_age", snap.get("retirement_age", ret_age)) or ret_age)
+
+        life_exp = int(snap.get("life_expectancy", 0) or 0)
+
+        use_multi = bool(snap.get("use_multi_asset", False))
+        cash_bal = float(snap.get("cash_bal", 0.0) or 0.0)
+        bonds_bal = float(snap.get("bonds_bal", 0.0) or 0.0)
+        etfs_bal = float(snap.get("etfs_bal", 0.0) or 0.0)
+        k401_bal = float(snap.get("k401_bal", 0.0) or 0.0)
+
+        if use_multi and (cash_bal + bonds_bal + etfs_bal + k401_bal) > 0:
+            starting_portfolio = cash_bal + bonds_bal + etfs_bal + k401_bal
+        else:
+            starting_portfolio = float(snap.get("current_portfolio", 0.0) or 0.0)
+
+        annual_contrib = float(snap.get("annual_contribution", 0.0) or 0.0)
+        planned_spend = float(snap.get("annual_spend_retirement", 0.0) or 0.0)
+
+        now_year = datetime.now().year
+        ret_year = now_year + max(0, int(ret_age - cur_age)) if (cur_age and ret_age and ret_age >= cur_age) else None
+
+        rows = [
+            ["Input", "Value"],
+            ["Current age", str(cur_age)],
+            ["Retirement age", str(ret_age)],
+            ["Estimated retirement year", str(ret_year) if ret_year else "—"],
+            ["Life expectancy", str(life_exp)],
+            ["Starting portfolio", _money(starting_portfolio)],
+            ["Retirement assets (401k)", _money(k401_bal) if k401_bal else "—"],
+            ["Annual contribution (pre-retirement)", _money(annual_contrib)],
+            ["Planned annual spending (year 1 of retirement)", _money(planned_spend)],
+            ["Pre-retirement mean return", f"{float(snap.get('pre_retire_return', 0.0) or 0.0)*100:.2f}%"],
+            ["Post-retirement mean return", f"{float(snap.get('post_retire_return', 0.0) or 0.0)*100:.2f}%"],
+            ["Inflation mean", f"{float(snap.get('inflation_rate', 0.0) or 0.0)*100:.2f}%"],
+        ]
+        y = _pdf_table(c, rows, x=margin, y=y, W=W - 2 * margin, col_widths=[0.55*(W-2*margin), 0.45*(W-2*margin)], font_size=9)
+        y -= 6
+
+        if use_multi and (cash_bal + bonds_bal + etfs_bal + k401_bal) > 0:
+            y = _pdf_section_title(c, "Portfolio Breakdown (Multi-Asset)", margin, y)
+            br = [
+                ["Asset", "Balance"],
+                ["Cash", _money(cash_bal)],
+                ["Bonds/Munis", _money(bonds_bal)],
+                ["ETFs", _money(etfs_bal)],
+                ["401k", _money(k401_bal)],
+                ["Total", _money(cash_bal + bonds_bal + etfs_bal + k401_bal)],
+            ]
+            y = _pdf_table(c, br, x=margin, y=y, W=W - 2 * margin, col_widths=[0.55*(W-2*margin), 0.45*(W-2*margin)], font_size=9)
+            y -= 6
+
+    except Exception:
+        y -= 6
+
+
+
+    # Baseline summary
+    _pdf_section_title(c, "Baseline Snapshot (Simulation)", margin, y)
+    y -= 20
+    try:
+        prob_deplete = float(baseline_res.get("prob_deplete", 0.0))
+        conf = 100.0 * (1.0 - prob_deplete)
+        median_final = float(baseline_res.get("median_final", np.percentile(baseline_res.get("final_balances", [0.0]), 50)))
+        p10_final = float(baseline_res.get("p10_final", np.percentile(baseline_res.get("final_balances", [0.0]), 10)))
+        p90_final = float(baseline_res.get("p90_final", np.percentile(baseline_res.get("final_balances", [0.0]), 90)))
+
+        y = _pdf_kpi_row(
+            c,
+            [
+                ("Confidence (0–100)", f"{conf:.0f}"),
+                ("Chance of depletion", f"{prob_deplete*100:.1f}%"),
+                ("Median ending balance", f"${median_final:,.0f}"),
+                ("10th / 90th ending", f"${p10_final:,.0f} / ${p90_final:,.0f}"),
+            ],
+            x=margin,
+            y=y,
+            W=W - 2 * margin,
+        )
+    except Exception:
+        y = y - 8
+
+    y -= 10
+    c.setFillColor(_PDF_BRAND["muted"])
+    c.setFont("Helvetica", 9)
+    c.drawString(margin, y, "Note: This report provides interpretation of modeled scenarios, not financial advice.")
+    y -= 18
+
+    # Stress test table
+    _pdf_section_title(c, "Market Reality Mode (Stress Tests)", margin, y)
+    y -= 16
+    if stress_rows:
+        header = ["Scenario", "Confidence Δ", "Spend impact", "Recovery time"]
+        rows = [header]
+        for r in stress_rows:
+            rows.append(
+                [
+                    str(r.get("scenario", ""))[:30],
+                    f"{float(r.get('confidence_delta', 0.0)):+.0f}",
+                    str(r.get("spend_impact", "N/A"))[:20],
+                    str(r.get("recovery_time", "N/A"))[:20],
+                ]
+            )
+        y = _pdf_table(c, rows, x=margin, y=y, W=W - 2 * margin)
+    else:
+        c.setFillColor(_PDF_BRAND["primary"])
+        c.setFont("Helvetica", 10)
+        c.drawString(margin, y, "No stress tests were run for this report.")
+        y -= 16
+
+    if y < 2.0 * inch:
+        c.showPage()
+        y = H - margin
+
+
+    # Narrative insights
+    _pdf_section_title(c, "AI-Powered Narrative Insights", margin, y)
+    y -= 16
+    c.setFillColor(_PDF_BRAND["primary"])
+    c.setFont("Helvetica", 10)
+
+    def _bullets(title: str, items: list[str], y0: float) -> float:
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(margin, y0, title)
+        y0 -= 12
+        c.setFont("Helvetica", 10)
+        for it in (items or [])[:6]:
+            txt = str(it)
+            for line in textwrap.wrap(txt, width=95):
+                c.drawString(margin + 10, y0, f"• {line}" if line == textwrap.wrap(txt, width=95)[0] else f"  {line}")
+                y0 -= 12
+                if y0 < 1.25 * inch:
+                    c.showPage()
+                    y0 = H - margin
+                    c.setFillColor(_PDF_BRAND["primary"])
+                    c.setFont("Helvetica", 10)
+        return y0 - 4
+
+    y = _bullets("Key insights", narrative.get("insights", []), y)
+    y = _bullets("Risks", narrative.get("risks", []), y)
+    y = _bullets("Tradeoffs", narrative.get("tradeoffs", []), y)
+    y = _bullets("What matters most", narrative.get("what_matters_most", []), y)
+
+    c.setFillColor(_PDF_BRAND["muted"])
+    c.setFont("Helvetica-Oblique", 8)
+    c.drawString(margin, 0.75 * inch, "Prepared by the Retirement Planner. Interpretation-only; not financial advice.")
+
     c.save()
     return buf.getvalue()
 
@@ -2018,6 +2517,249 @@ def _sustainable_spend_mc_cached(
     best = float(max(0.0, math.floor(best / 100.0) * 100.0))
     return {"spend": best, "success": float(best_succ), "target": float(target_success), "n_sims": int(n_sims)}
 
+
+# -----------------------------------------------------------------------------
+# PHASE 2 (2.E/2.F): Stress tests + Life Events helpers (cached runners)
+# -----------------------------------------------------------------------------
+def _safe_json_dumps(obj) -> str:
+    """Stable JSON for caching keys (best-effort)."""
+    try:
+        return json.dumps(obj, sort_keys=True, default=str)
+    except Exception:
+        return json.dumps(str(obj), sort_keys=True)
+
+
+@st.cache_data(show_spinner=False)
+def _mc_cached_with_extensions(
+    snap_norm: dict,
+    n_sims: int,
+    seed: int,
+    pre_sigma: float,
+    post_sigma: float,
+    infl_sigma: float,
+    life_events_json: str = "",
+    stress_shocks_json: str = "",
+) -> dict:
+    """Cached Monte Carlo runner that supports Phase 2 extensions without changing baseline behavior."""
+    life_events = json.loads(life_events_json) if (life_events_json or "") else None
+    stress_shocks = json.loads(stress_shocks_json) if (stress_shocks_json or "") else None
+    return monte_carlo_projection_from_snapshot(
+        snap_norm,
+        n_sims=int(n_sims),
+        seed=int(seed),
+        pre_sigma=float(pre_sigma),
+        post_sigma=float(post_sigma),
+        infl_sigma=float(infl_sigma),
+        stress_shocks=stress_shocks,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _sustainable_spend_mc_cached_with_extensions(
+    snap_norm: dict,
+    target_success: float,
+    n_sims: int,
+    seed: int,
+    pre_sigma: float,
+    post_sigma: float,
+    infl_sigma: float,
+    life_events_json: str = "",
+    stress_shocks_json: str = "",
+) -> dict:
+    """Sustainable spend calculator, but under life events + stress shocks."""
+    s0 = copy.deepcopy(snap_norm)
+    life_events = json.loads(life_events_json) if (life_events_json or "") else None
+    stress_shocks = json.loads(stress_shocks_json) if (stress_shocks_json or "") else None
+
+    planned = float(s0.get("annual_spend_retirement", 0.0))
+    start_port = float(s0.get("current_portfolio", 0.0))
+    lo = 0.0
+    hi = max(planned * 3.0, start_port * 0.10, 50_000.0)
+
+    def _success_for_spend(sp: float) -> float:
+        s = copy.deepcopy(s0)
+        s["annual_spend_retirement"] = float(max(0.0, sp))
+        res = monte_carlo_projection_from_snapshot(
+            s,
+            n_sims=int(n_sims),
+            seed=int(seed),
+            pre_sigma=float(pre_sigma),
+            post_sigma=float(post_sigma),
+            infl_sigma=float(infl_sigma),
+            stress_shocks=stress_shocks,
+        )
+        prob_deplete = float(res.get("prob_deplete", 0.0))
+        return 1.0 - prob_deplete
+
+    succ_hi = _success_for_spend(hi)
+    if succ_hi >= target_success and hi < 5_000_000:
+        hi2 = min(5_000_000.0, hi * 1.5)
+        succ_hi2 = _success_for_spend(hi2)
+        if succ_hi2 >= target_success:
+            hi = hi2
+            succ_hi = succ_hi2
+
+    tol = 500.0
+    best = lo
+    best_succ = 1.0
+    for _ in range(18):
+        mid = (lo + hi) / 2.0
+        succ = _success_for_spend(mid)
+        if succ >= target_success:
+            best = mid
+            best_succ = succ
+            lo = mid
+        else:
+            hi = mid
+        if (hi - lo) <= tol:
+            break
+
+    best = float(max(0.0, math.floor(best / 100.0) * 100.0))
+    return {"spend": best, "success": float(best_succ), "target": float(target_success), "n_sims": int(n_sims)}
+
+
+def _build_stress_shocks_for_preset(snap_norm: dict, preset_id: str) -> tuple[dict, list[dict], str]:
+    """Return (modified_snapshot, stress_shocks, label). Does not mutate input."""
+    s = copy.deepcopy(snap_norm)
+    current_age = int(s.get("current_age", 50))
+    retire_age = int(s.get("retire_age", 65))
+    life_expectancy = int(s.get("life_expectancy", 95))
+
+    preset_id = (preset_id or "").strip().lower()
+    shocks: list[dict] = []
+    label = preset_id
+
+    if preset_id == "retirement_crash":
+        label = "Retirement-year crash"
+        shocks.append({"type": "one_time_return", "age": retire_age, "shock_return": -0.30, "label": label})
+
+    elif preset_id == "lost_decade":
+        label = "Lost decade (low returns)"
+        shocks.append(
+            {
+                "type": "return_regime",
+                "start_age": retire_age,
+                "end_age": retire_age + 9,
+                "mu": 0.02,
+                "sigma": 0.10,
+                "label": label,
+            }
+        )
+
+    elif preset_id == "high_inflation":
+        label = "High inflation decade"
+        shocks.append(
+            {
+                "type": "inflation_regime",
+                "start_age": retire_age,
+                "end_age": retire_age + 9,
+                "mu": 0.06,
+                "sigma": 0.015,
+                "label": label,
+            }
+        )
+
+    elif preset_id == "longevity_100":
+        label = "Longevity shock (to age 100)"
+        s["life_expectancy"] = int(max(life_expectancy, 100))
+
+    elif preset_id == "healthcare_spike":
+        label = "Healthcare cost spike"
+        # Step-up spending starting at age 75 (or retirement if later)
+        start = max(retire_age, 75)
+        shocks.append(
+            {
+                "type": "spend_step",
+                "start_age": start,
+                "end_age": int(s.get("life_expectancy", life_expectancy)),
+                "add_spend_today": 25_000.0,
+                "label": label,
+            }
+        )
+
+    return s, shocks, label
+
+
+def _stress_test_recovery_time(baseline_res: dict, stressed_res: dict, shock_label: str) -> str:
+    """Recovery time based on when stressed median (p50) reaches baseline median again."""
+    try:
+        ages = baseline_res.get("ages")
+        b50 = np.asarray(baseline_res.get("p50"), dtype=float)
+        s50 = np.asarray(stressed_res.get("p50"), dtype=float)
+        if ages is None or len(ages) == 0:
+            return "N/A"
+        # Find first age where stressed median >= baseline median (within 2%)
+        for i in range(len(ages)):
+            if s50[i] >= 0.98 * b50[i]:
+                return f"~{int(ages[i])} (age), {i} yr(s)"
+        return "Not recovered by horizon"
+    except Exception:
+        return "N/A"
+
+
+def _narrative_insights(baseline_res: dict, stress_rows: list[dict], life_events: list[dict]) -> dict:
+    """Plain-language interpretation (interpretation, not advice)."""
+    insights: list[str] = []
+    risks: list[str] = []
+    tradeoffs: list[str] = []
+
+    try:
+        base_prob_deplete = float(baseline_res.get("prob_deplete", 0.0))
+        base_conf = 100.0 * (1.0 - base_prob_deplete)
+        if base_prob_deplete <= 0.10:
+            insights.append("Baseline simulation outcomes are generally resilient across typical market variability.")
+        elif base_prob_deplete <= 0.25:
+            insights.append("Baseline outcomes show meaningful variability; some paths deplete before the planning horizon.")
+        else:
+            insights.append("Baseline outcomes indicate elevated depletion risk in a material portion of simulated paths.")
+
+        # Identify the biggest confidence drop from stress tests
+        if stress_rows:
+            worst = sorted(stress_rows, key=lambda r: float(r.get("confidence_delta", 0.0)))[:1]
+            if worst:
+                w = worst[0]
+                risks.append(
+                    f"The largest sensitivity comes from '{w.get('scenario')}', which reduces confidence by about {abs(float(w.get('confidence_delta', 0.0))):.0f} points."
+                )
+
+        if life_events:
+            risks.append(
+                "Life events add uncertainty because they introduce one-time or multi-year cashflow shocks that do not follow market cycles."
+            )
+
+        tradeoffs.append(
+            "Higher planned spending increases depletion risk in adverse sequences, while lower spending tends to improve resilience but reduces near-term lifestyle headroom."
+        )
+        tradeoffs.append(
+            "Stress scenarios primarily change outcomes by shifting early-retirement sequence risk (crash / lost decade) or by increasing long-run drag (inflation / healthcare / longevity)."
+        )
+
+        what_matters = []
+        what_matters.append(f"Baseline confidence (success probability) is roughly {base_conf:.0f}/100.")
+        if stress_rows:
+            deltas = [float(r.get("confidence_delta", 0.0)) for r in stress_rows]
+            what_matters.append(
+                f"Across the selected stress tests, confidence deltas range from {min(deltas):.0f} to {max(deltas):.0f} points."
+            )
+        if life_events:
+            what_matters.append(
+                f"{len(life_events)} life event(s) are modeled as additional cashflows; their timing and size can dominate individual simulation paths."
+            )
+
+        return {
+            "insights": insights,
+            "risks": risks,
+            "tradeoffs": tradeoffs,
+            "what_matters_most": what_matters,
+        }
+    except Exception:
+        return {
+            "insights": ["Unable to generate narrative insights due to an internal error."],
+            "risks": [],
+            "tradeoffs": [],
+            "what_matters_most": [],
+        }
+
 def _sim_return_draw(rng: np.random.Generator, mu: float, sigma: float, size: int) -> np.ndarray:
     """
     Draw arithmetic returns with a simple guardrail so we never go below -100%.
@@ -2044,6 +2786,93 @@ def _normalize_goals(goals, current_age:int, inflation_mu:float):
     out = []
     if not goals:
         return out
+
+
+
+def _normalize_life_events(raw_events, current_age: int, inflation_mu: float):
+    """Normalize structured life events into a safe internal schema.
+
+    Expected internal keys (per event):
+      - title: str
+      - start_age: int
+      - duration_years: int (>=1)
+      - amount_low_today: float (>=0)
+      - amount_high_today: float (>= amount_low_today)
+      - probability: float in [0,1]
+      - inflate: bool (default True)
+      - direction: 'expense' or 'income' (default 'expense')
+
+    Notes:
+      - This is strictly normalization/validation. No behavioral change occurs unless
+        callers pass life_events into the MC engine.
+    """
+    out: list[dict] = []
+    if not raw_events:
+        return out
+
+    events = raw_events
+    # Support session_state dict wrapper patterns
+    if isinstance(raw_events, dict) and "events" in raw_events and isinstance(raw_events["events"], list):
+        events = raw_events["events"]
+
+    if not isinstance(events, list):
+        return out
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        try:
+            title = str(ev.get("title") or ev.get("name") or ev.get("type") or "Life Event").strip()
+            ev_type = str(ev.get("type") or "").strip().lower()
+
+            start_age = int(ev.get("start_age", ev.get("age", current_age)))
+            start_age = max(int(current_age), start_age)
+
+            duration_years = int(ev.get("duration_years", ev.get("duration", 1)))
+            duration_years = max(1, duration_years)
+
+            # Accept multiple field spellings
+            lo = ev.get("amount_low_today", ev.get("cost_low_today", ev.get("amount_low", ev.get("cost_low", 0.0))))
+            hi = ev.get("amount_high_today", ev.get("cost_high_today", ev.get("amount_high", ev.get("cost_high", lo))))
+            lo = float(lo) if lo is not None else 0.0
+            hi = float(hi) if hi is not None else lo
+            lo = max(0.0, lo)
+            hi = max(lo, hi)
+
+            prob = ev.get("probability", ev.get("prob", 1.0))
+            prob = float(prob) if prob is not None else 1.0
+            if math.isnan(prob) or math.isinf(prob):
+                prob = 1.0
+            prob = float(min(1.0, max(0.0, prob)))
+
+            inflate = ev.get("inflate", True)
+            inflate = bool(inflate)
+
+            direction = str(ev.get("direction", "expense")).strip().lower()
+            if direction not in ("expense", "income"):
+                # Try to infer from sign if user stored signed amount
+                signed_amt = float(ev.get("amount", 0.0) or 0.0)
+                direction = "income" if signed_amt > 0 else "expense"
+
+            out.append(
+                {
+                    "type": ev_type or "custom",
+                    "title": title,
+                    "start_age": int(start_age),
+                    "duration_years": int(duration_years),
+                    "amount_low_today": float(lo),
+                    "amount_high_today": float(hi),
+                    "probability": float(prob),
+                    "inflate": bool(inflate),
+                    "direction": direction,
+                    # keep inflation_mu for downstream consumers if needed
+                    "inflation_mu": float(inflation_mu),
+                }
+            )
+        except Exception:
+            continue
+
+    return out
     for g in goals:
         try:
             title = str(g.get("title") or "Goal")
@@ -2078,6 +2907,8 @@ def monte_carlo_projection_from_snapshot(
     pre_sigma: float = 0.15,
     post_sigma: float = 0.10,
     infl_sigma: float = 0.01,
+    life_events: list[dict] | None = None,
+    stress_shocks: list[dict] | None = None,
     # Optional behavior tweaks (opt-in; defaults preserve prior deterministic assumptions)
     use_spending_floor: bool = False,
     spending_floor_multiple: float = 18.0,   # if assets < multiple * current-year spend, reduce spend
@@ -2102,6 +2933,14 @@ def monte_carlo_projection_from_snapshot(
 
     # Optional one-time goals (e.g., college funding, home purchase, legacy gift)
     goals = _normalize_goals(s.get('goals', []), current_age=int(s['current_age']), inflation_mu=float(s['inflation_rate']))
+
+    # Phase 2 (opt-in): structured life events + market stress shocks
+    norm_life_events = _normalize_life_events(
+        life_events,
+        current_age=int(s['current_age']),
+        inflation_mu=float(s['inflation_rate']),
+    )
+    norm_stress_shocks: list[dict] = [copy.deepcopy(x) for x in (stress_shocks or []) if isinstance(x, dict)]
 
     if n_trials is not None:
         n_sims = int(n_trials)
@@ -2140,6 +2979,34 @@ def monte_carlo_projection_from_snapshot(
     for sim in range(n_sims):
         portfolio = max(0.0, start_portfolio)
 
+        # --- Phase 2: life events realization for this simulation (deterministic per sim) ---
+        sim_life_events: list[dict] = []
+        if norm_life_events:
+            for ev in norm_life_events:
+                try:
+                    if float(ev.get("probability", 1.0)) < 1.0:
+                        if float(rng.random()) > float(ev.get("probability", 1.0)):
+                            continue
+                    lo = float(ev.get("amount_low_today", 0.0))
+                    hi = float(ev.get("amount_high_today", lo))
+                    amt_today = float(rng.uniform(lo, hi)) if hi > lo else float(lo)
+                    years_from_now = max(0, int(ev.get("start_age", current_age)) - int(current_age))
+                    if bool(ev.get("inflate", True)):
+                        amt = amt_today * ((1.0 + mu_infl) ** years_from_now)
+                    else:
+                        amt = amt_today
+                    sign = 1.0 if str(ev.get("direction", "expense")).strip().lower() == "income" else -1.0
+                    sim_life_events.append(
+                        {
+                            "title": str(ev.get("title", "Life Event")),
+                            "start_age": int(ev.get("start_age", current_age)),
+                            "end_age": int(ev.get("start_age", current_age)) + int(ev.get("duration_years", 1)) - 1,
+                            "amount": float(sign * amt),
+                        }
+                    )
+                except Exception:
+                    continue
+
         # Track retirement spend target that is allowed to deviate under rules
         spend = spend_today
         baseline_spend = spend_today  # inflation-only baseline for "raise cap"
@@ -2151,7 +3018,21 @@ def monte_carlo_projection_from_snapshot(
             is_retired = age >= retire_age
 
             # Inflation draw for the year (bounded to avoid absurd spikes in UI)
-            infl = float(rng.normal(mu_infl, infl_sigma))
+            mu_infl_use = mu_infl
+            sigma_infl_use = infl_sigma
+            if norm_stress_shocks:
+                for sh in norm_stress_shocks:
+                    try:
+                        if str(sh.get("type")) == "inflation_regime":
+                            a0 = int(sh.get("start_age", -9_999))
+                            a1 = int(sh.get("end_age", -9_999))
+                            if int(age) >= a0 and int(age) <= a1:
+                                mu_infl_use = float(sh.get("mu", mu_infl_use))
+                                sigma_infl_use = float(sh.get("sigma", sigma_infl_use))
+                    except Exception:
+                        continue
+
+            infl = float(rng.normal(mu_infl_use, sigma_infl_use))
             infl = float(np.clip(infl, -0.01, 0.10))
 
             # Update baseline and the working spend (inflation is applied regardless)
@@ -2170,10 +3051,25 @@ def monte_carlo_projection_from_snapshot(
             withdrawal = 0.0
             contrib = 0.0
 
+            # Extra spending step-ups (e.g., healthcare spike) are applied in retirement years only.
+            extra_spend = 0.0
+            if is_retired and norm_stress_shocks:
+                for sh in norm_stress_shocks:
+                    try:
+                        if str(sh.get("type")) == "spend_step":
+                            a0 = int(sh.get("start_age", -9_999))
+                            a1 = int(sh.get("end_age", 9_999))
+                            if int(age) >= a0 and int(age) <= a1:
+                                add_today = float(sh.get("add_spend_today", 0.0))
+                                years_from_now = max(0, int(age) - int(current_age))
+                                extra_spend += add_today * ((1.0 + mu_infl) ** years_from_now)
+                    except Exception:
+                        continue
+
             if not is_retired:
                 contrib = annual_contrib
             else:
-                withdrawal = max(0.0, spend - guaranteed)
+                withdrawal = max(0.0, (spend + extra_spend) - guaranteed)
 
                 # --- Guardrails (Guyton-Klinger style, simplified) ---
                 if use_guardrails and portfolio > 0:
@@ -2186,13 +3082,13 @@ def monte_carlo_projection_from_snapshot(
 
                         if wr > upper:
                             spend *= (1.0 - guardrail_cut_pct)
-                            withdrawal = max(0.0, spend - guaranteed)
+                            withdrawal = max(0.0, (spend + extra_spend) - guaranteed)
                         elif wr < lower:
                             # raise, but cap vs inflation-adjusted baseline
                             spend_candidate = spend * (1.0 + guardrail_raise_pct)
                             cap = baseline_spend * (1.0 + guardrail_raise_cap_pct)
                             spend = min(spend_candidate, cap)
-                            withdrawal = max(0.0, spend - guaranteed)
+                            withdrawal = max(0.0, (spend + extra_spend) - guaranteed)
 
                 # --- Spending floor ("what-if spending reduction in bad paths") ---
                 if use_spending_floor and portfolio > 0:
@@ -2201,7 +3097,7 @@ def monte_carlo_projection_from_snapshot(
                         floor_active = True
                     if floor_active:
                         spend *= (1.0 - spending_floor_cut_pct)
-                        withdrawal = max(0.0, spend - guaranteed)
+                        withdrawal = max(0.0, (spend + extra_spend) - guaranteed)
                         # deactivate once assets recover (hysteresis)
                         if portfolio > (spending_floor_recover_multiple * max(1.0, spend)):
                             floor_active = False
@@ -2220,18 +3116,52 @@ def monte_carlo_projection_from_snapshot(
             if goal_withdrawal > 0.0:
                 withdrawal += goal_withdrawal
 
+            # Phase 2 life events: apply net cashflow (income positive, expense negative)
+            event_net = 0.0
+            if sim_life_events:
+                for ev in sim_life_events:
+                    if int(ev["start_age"]) <= int(age) <= int(ev["end_age"]):
+                        event_net += float(ev["amount"])
+
             # Apply net cashflows then return draw
             start_bal = portfolio
-            portfolio = start_bal + contrib - withdrawal
+            portfolio = start_bal + contrib - withdrawal + event_net
             portfolio = max(0.0, portfolio)
 
             # Return draw
             if portfolio > 0:
                 mu = mu_post if is_retired else mu_pre
                 sigma = post_sigma if is_retired else pre_sigma
+
+                # Stress regimes can override mu/sigma for a window
+                if norm_stress_shocks:
+                    for sh in norm_stress_shocks:
+                        try:
+                            if str(sh.get("type")) == "return_regime":
+                                a0 = int(sh.get("start_age", -9_999))
+                                a1 = int(sh.get("end_age", -9_999))
+                                if int(age) >= a0 and int(age) <= a1:
+                                    mu = float(sh.get("mu", mu))
+                                    sigma = float(sh.get("sigma", sigma))
+                        except Exception:
+                            continue
+
                 r = float(rng.normal(mu, sigma))
                 # clamp to prevent extreme single-year blowups that dominate charts
                 r = float(np.clip(r, -0.80, 0.80))
+
+                # One-time return shocks (e.g., retirement-year crash)
+                if norm_stress_shocks:
+                    for sh in norm_stress_shocks:
+                        try:
+                            if str(sh.get("type")) == "one_time_return":
+                                if int(sh.get("age", -9_999)) == int(age):
+                                    shock_r = float(sh.get("shock_return", 0.0))
+                                    # Combine multiplicatively to avoid impossible arithmetic < -100%
+                                    r = (1.0 + r) * (1.0 + shock_r) - 1.0
+                        except Exception:
+                            continue
+
                 portfolio *= (1.0 + r)
 
             portfolio = max(0.0, portfolio)
@@ -2352,7 +3282,35 @@ st.markdown("---")
 # -----------------------------------------------------------------------------
 # TABS: SINGLE vs COMPARE
 # -----------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["Single Scenario", "Compare Scenarios", "Range of Outcomes (Simulation)"])
+# UI: Make top tab bar horizontally scrollable (prevents overflow when tabs grow)
+# -----------------------------------------------------------------------------
+st.markdown(
+    """
+<style>
+/* Streamlit tabs horizontal scroll */
+div[data-baseweb="tab-list"] {
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  scrollbar-width: thin;
+}
+div[data-baseweb="tab-list"] > button {
+  flex: 0 0 auto;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+# -----------------------------------------------------------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "Single Scenario",
+        "Compare Scenarios",
+        "Range of Outcomes (Simulation)",
+        "Market Reality Mode (Stress Tests)",
+        "One-Time Retirement Readiness Report",
+    ]
+)
 
 # =============================================================================
 # TAB 1: SINGLE SCENARIO (your app, minimally modified for keyed widgets)
@@ -3398,6 +4356,21 @@ with tab2:
             if "Withdrawal Rate (1st yr)" in kpi_df.columns:
                 kpi_df["Withdrawal Rate (1st yr)"] = kpi_df["Withdrawal Rate (1st yr)"].astype(float).map(lambda x: f"{x*100:.2f}%")
             st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+            # Persist compare summary for the One-Time Readiness Report
+            try:
+                _sc_list = []
+                for _sc in chosen:
+                    _k = _sc.get('kpis') or {}
+                    _inp = _sc.get('inputs') or {}
+                    _sc_list.append({
+                        'name': _sc.get('name',''),
+                        'confidence': _k.get('confidence_score', _k.get('confidence', '')),
+                        'sustainable_spend': _k.get('sustainable_spend', _k.get('spend', '')),
+                        'retirement_age': _inp.get('retire_age', _inp.get('retirement_age', '')),
+                    })
+                st.session_state['report_compare'] = {'generated_at': datetime.now().isoformat(), 'scenarios': _sc_list}
+            except Exception:
+                pass
 
             fig, ax = plt.subplots(figsize=(10, 5))
             for sc in chosen:
@@ -3595,6 +4568,17 @@ with tab3:
                 return f"${float(x):,.1f}"
     
             st.markdown("### Key takeaways")
+            # Persist range-of-outcomes summary for the One-Time Readiness Report
+            try:
+                _p10 = float(res.get('p10_final', float(np.percentile(res.get('final_balances',[0.0]), 10))))
+                _p50 = float(res.get('median_final', float(np.percentile(res.get('final_balances',[0.0]), 50))))
+                _p90 = float(res.get('p90_final', float(np.percentile(res.get('final_balances',[0.0]), 90))))
+                st.session_state['report_range_outcomes'] = {
+                    'generated_at': datetime.now().isoformat(),
+                    'metrics': {'Ending balance at horizon': {'p10': _p10, 'p50': _p50, 'p90': _p90}},
+                }
+            except Exception:
+                pass
             m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("Chance of running out of funds", f"{res['prob_deplete']*100:.1f}%")
@@ -3712,3 +4696,230 @@ with tab3:
     
     
     # =============================================================================
+
+
+# =============================================================================
+# TAB 4: MARKET REALITY MODE (STRESS TEST LIBRARY)
+# =============================================================================
+with tab4:
+    st.header("Market Reality Mode: Stress-Test Library")
+    st.caption(
+        "Run prebuilt shocks against your current scenario using the same Monte Carlo engine. "
+        "Outputs are expressed as deltas vs your baseline simulation."
+    )
+
+    snap = normalize_snapshot(get_current_inputs_snapshot())
+
+    colA, colB = st.columns([2, 1])
+    with colA:
+        presets = {
+            "Retirement-year crash": "retirement_crash",
+            "Lost decade (low returns)": "lost_decade",
+            "High inflation decade": "high_inflation",
+            "Longevity shock (living to 100)": "longevity_100",
+            "Healthcare cost spike": "healthcare_spike",
+        }
+        selected = st.multiselect(
+            "Select stress tests to run",
+            options=list(presets.keys()),
+            default=["Retirement-year crash", "Lost decade (low returns)"]
+            if "phase2_stress_selected" not in st.session_state
+            else st.session_state.get("phase2_stress_selected", []),
+            key="phase2_stress_selected",
+        )
+
+    with colB:
+        st.markdown("#### Simulation settings")
+        n_sims = st.number_input("Simulations", 300, 10_000, 1500, 100, key="phase2_stress_n_sims")
+        seed = st.number_input("Random seed", 0, 999_999, 42, 1, key="phase2_stress_seed")
+        pre_sigma = st.slider("Pre-retirement volatility (%)", 0.0, 30.0, 15.0, 0.5, key="phase2_stress_pre_sigma") / 100.0
+        post_sigma = st.slider("Post-retirement volatility (%)", 0.0, 30.0, 10.0, 0.5, key="phase2_stress_post_sigma") / 100.0
+        infl_sigma = st.slider("Inflation volatility (%)", 0.0, 6.0, 1.0, 0.1, key="phase2_stress_infl_sigma") / 100.0
+
+    target_success = st.slider(
+        "Target success probability for spend-impact metric",
+        0.60,
+        0.95,
+        0.80,
+        0.01,
+        key="phase2_stress_target_success",
+        help="Spend impact is computed by estimating the sustainable retirement spend (today $) that meets this target success rate.",
+    )
+
+    run_suite = st.button("Run selected stress tests", type="primary", key="phase2_run_stress_suite")
+    if run_suite:
+        with st.spinner("Running baseline + stress simulations..."):
+            # Baseline run
+            base_res = _mc_cached_with_extensions(
+                snap,
+                n_sims=int(n_sims),
+                seed=int(seed),
+                pre_sigma=float(pre_sigma),
+                post_sigma=float(post_sigma),
+                infl_sigma=float(infl_sigma),
+                stress_shocks_json="",
+            )
+            base_conf = 100.0 * (1.0 - float(base_res.get("prob_deplete", 0.0)))
+            base_spend = _sustainable_spend_mc_cached_with_extensions(
+                snap,
+                target_success=float(target_success),
+                n_sims=int(max(600, int(n_sims // 2))),
+                seed=int(seed),
+                pre_sigma=float(pre_sigma),
+                post_sigma=float(post_sigma),
+                infl_sigma=float(infl_sigma),
+                stress_shocks_json="",
+            )["spend"]
+
+            rows: list[dict] = []
+            for name in selected:
+                pid = presets.get(name)
+                if not pid:
+                    continue
+                s_mod, shocks, label = _build_stress_shocks_for_preset(snap, pid)
+                stress_res = _mc_cached_with_extensions(
+                    s_mod,
+                    n_sims=int(n_sims),
+                    seed=int(seed),
+                    pre_sigma=float(pre_sigma),
+                    post_sigma=float(post_sigma),
+                    infl_sigma=float(infl_sigma),
+                    stress_shocks_json=_safe_json_dumps(shocks),
+                )
+                stress_conf = 100.0 * (1.0 - float(stress_res.get("prob_deplete", 0.0)))
+                conf_delta = float(stress_conf - base_conf)
+
+                stress_spend = _sustainable_spend_mc_cached_with_extensions(
+                    s_mod,
+                    target_success=float(target_success),
+                    n_sims=int(max(600, int(n_sims // 2))),
+                    seed=int(seed),
+                    pre_sigma=float(pre_sigma),
+                    post_sigma=float(post_sigma),
+                    infl_sigma=float(infl_sigma),
+                    stress_shocks_json=_safe_json_dumps(shocks),
+                )["spend"]
+                spend_impact = float(stress_spend - base_spend)
+
+                rec = _stress_test_recovery_time(base_res, stress_res, label)
+
+                rows.append(
+                    {
+                        "scenario": label,
+                        "confidence_delta": conf_delta,
+                        "spend_impact": f"{spend_impact:+,.0f}/yr",
+                        "recovery_time": rec,
+                    }
+                )
+
+            # Persist for report tab
+            st.session_state["phase2_baseline_mc"] = base_res
+            st.session_state["phase2_stress_rows"] = rows
+            st.session_state["phase2_narrative"] = _narrative_insights(base_res, rows, None)
+
+        st.success("Stress tests complete.")
+
+    base_res = st.session_state.get("phase2_baseline_mc")
+    rows = st.session_state.get("phase2_stress_rows", [])
+    if base_res:
+        base_conf = 100.0 * (1.0 - float(base_res.get("prob_deplete", 0.0)))
+        st.markdown("### Baseline reference")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Baseline Confidence (0–100)", f"{base_conf:.0f}")
+        with c2:
+            st.metric("Chance of depletion", f"{float(base_res.get('prob_deplete', 0.0))*100:.1f}%")
+        with c3:
+            st.metric("Median ending balance", f"${float(base_res.get('median_final', 0.0)):,.0f}")
+
+    if rows:
+        st.markdown("### Stress test results")
+        df_rows = pd.DataFrame(rows)
+        st.dataframe(df_rows, use_container_width=True)
+
+        # Narrative (Phase 2.G)
+        st.markdown("### AI-Powered Narrative Insights")
+        narr = st.session_state.get("phase2_narrative", {})
+        for sec, items in [
+            ("Key insights", narr.get("insights", [])),
+            ("Risks", narr.get("risks", [])),
+            ("Tradeoffs", narr.get("tradeoffs", [])),
+            ("What matters most", narr.get("what_matters_most", [])),
+        ]:
+            with st.expander(sec, expanded=(sec == "Key insights")):
+                if not items:
+                    st.write("(none)")
+                else:
+                    for it in items:
+                        st.write(f"- {it}")
+
+    if not rows and not run_suite:
+        st.info("Select one or more stress tests above and click **Run selected stress tests**.")
+
+
+# =============================================================================
+# TAB 5: LIFE EVENTS ENGINE
+# =============================================================================
+with tab5:
+    st.header("One-Time Retirement Readiness Report")
+    st.caption(
+        "A shareable PDF that bundles: baseline simulation, stress test deltas, modeled life events, and plain-language insights."
+    )
+
+    snap = normalize_snapshot(get_current_inputs_snapshot())
+
+    if "phase2_baseline_mc" not in st.session_state:
+        st.info("Run stress tests at least once (Tab: Market Reality Mode) to populate the report, or generate a baseline-only report below.")
+
+    colr1, colr2 = st.columns([1, 1])
+    with colr1:
+        n_sims = st.number_input("Simulations for report", 300, 10_000, 2000, 100, key="phase2_report_n_sims")
+    with colr2:
+        seed = st.number_input("Random seed (report)", 0, 999_999, 42, 1, key="phase2_report_seed")
+
+    gen_report = st.button("Generate Retirement Readiness Report (PDF)", type="primary", key="phase2_gen_report_btn")
+    if gen_report:
+        with st.spinner("Building report..."):
+            base_res = st.session_state.get("phase2_baseline_mc")
+            if not base_res:
+                base_res = _mc_cached_with_extensions(
+                    snap,
+                    n_sims=int(n_sims),
+                    seed=int(seed),
+                    pre_sigma=0.15,
+                    post_sigma=0.10,
+                    infl_sigma=0.01,
+                    stress_shocks_json="",
+                )
+            rows = st.session_state.get("phase2_stress_rows", [])
+            narrative = st.session_state.get("phase2_narrative") or _narrative_insights(base_res, rows, None)
+
+            # Assemble report payload from other tabs (best-effort)
+            # Assemble report payload from other tabs (uses last computed artifacts in this session)
+            report_payload = {
+                'generated_at': datetime.now().isoformat(),
+                'compare': st.session_state.get('report_compare', {}),
+                'range_outcomes': st.session_state.get('report_range_outcomes', {}),
+                'stress_tests': {'rows': st.session_state.get('phase2_stress_rows', [])},
+            }
+
+            pdf_bytes = _build_readiness_report_pdf_bytes(
+                user_id=st.session_state.get("current_user", "unknown"),
+                snap=snap,
+                baseline_res=base_res,
+                stress_rows=rows,
+                narrative=narrative,
+        report_payload=report_payload,
+            )
+            st.session_state["phase2_readiness_pdf"] = pdf_bytes
+        st.success("Report generated.")
+
+    pdf_bytes = st.session_state.get("phase2_readiness_pdf")
+    if pdf_bytes:
+        st.download_button(
+            "Download Retirement Readiness Report (PDF)",
+            data=pdf_bytes,
+            file_name=f"retirement_readiness_report_{st.session_state.get('current_user','user')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
