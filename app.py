@@ -8,9 +8,8 @@ import hashlib
 import hmac
 import copy
 import uuid
-import math
 import secrets
-
+import math
 
 from io import BytesIO
 from datetime import datetime
@@ -1688,6 +1687,123 @@ def _hash_password(password: str, salt: str) -> str:
     return dk.hex()
 
 
+
+# -----------------------------------------------------------------------------
+# SUPABASE USER CREDENTIALS + PASSWORD CHANGE LOG (optional)
+# -----------------------------------------------------------------------------
+def _sb_auth_table() -> str:
+    return st.secrets.get("supabase", {}).get("auth_table", "app_user_credentials")
+
+def _sb_password_changes_table() -> str:
+    return st.secrets.get("supabase", {}).get("password_changes_table", "app_password_changes")
+
+def _new_salt() -> str:
+    """Generate a per-user salt for password hashing."""
+    try:
+        return secrets.token_hex(16)
+    except Exception:
+        return str(uuid.uuid4()).replace("-", "")
+
+def _hash_password_v2(password: str, salt: str, iterations: int = 200_000) -> str:
+    """PBKDF2-SHA256 hash used for Supabase-stored credentials."""
+    try:
+        it = int(iterations) if int(iterations) > 50_000 else 200_000
+    except Exception:
+        it = 200_000
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        (password or "").encode("utf-8"),
+        (salt or "").encode("utf-8"),
+        it,
+    )
+    return dk.hex()
+
+def sb_get_user_credentials(user_id: str) -> dict | None:
+    """Fetch user's credential row from Supabase. Returns None if missing/unavailable."""
+    client = get_supabase_client()
+    if client is None:
+        return None
+    try:
+        res = (
+            client.table(_sb_auth_table())
+            .select("user_id,password_hash,salt,algo,iterations,updated_at,created_at,is_active")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        row = getattr(res, "data", None) or None
+        return row if row else None
+    except Exception as e:
+        _sb_debug_log(f"WARN: sb_get_user_credentials failed: {e}")
+        return None
+
+def sb_verify_user_password(user_id: str, password: str) -> bool:
+    row = sb_get_user_credentials(user_id)
+    if not row or not row.get("password_hash") or not row.get("salt"):
+        return False
+    if row.get("is_active") is False:
+        return False
+    iterations = row.get("iterations") or 200_000
+    computed = _hash_password_v2(password, row.get("salt"), iterations=int(iterations))
+    try:
+        return hmac.compare_digest(computed, str(row.get("password_hash")))
+    except Exception:
+        return False
+
+def sb_set_user_password(
+    user_id: str,
+    new_password: str,
+    old_password_hash: str | None = None,
+    *,
+    changed_by: str | None = None,
+    change_reason: str = "user_initiated",
+    metadata: dict | None = None,
+) -> bool:
+    """Upsert credentials row and append to password change log (best-effort)."""
+    client = get_supabase_client()
+    if client is None:
+        return False
+
+    salt = _new_salt()
+    iterations = 200_000
+    algo = "pbkdf2_sha256"
+    new_hash = _hash_password_v2(new_password, salt, iterations=iterations)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cred_payload = {
+        "user_id": user_id,
+        "password_hash": new_hash,
+        "salt": salt,
+        "algo": algo,
+        "iterations": iterations,
+        "updated_at": now_iso,
+        "is_active": True,
+    }
+
+    try:
+        client.table(_sb_auth_table()).upsert(cred_payload, on_conflict="user_id").execute()
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_set_user_password upsert failed: {e}")
+        return False
+
+    # Change log (non-fatal if logging fails)
+    try:
+        change_payload = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "old_password_hash": old_password_hash,
+            "new_password_hash": new_hash,
+            "changed_at": now_iso,
+            "changed_by": changed_by or user_id,
+            "change_reason": change_reason,
+            "metadata": metadata or {},
+        }
+        client.table(_sb_password_changes_table()).insert(change_payload).execute()
+    except Exception as e:
+        _sb_debug_log(f"WARN: password change log insert failed (non-fatal): {e}")
+
+    return True
+
 def require_login():
     if st.session_state.get("is_authenticated", False):
         return
@@ -1700,7 +1816,23 @@ def require_login():
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in")
 
+
     if submitted:
+        # If Supabase credentials exist for this user, enforce Supabase auth.
+        if _sb_enabled():
+            sb_row = sb_get_user_credentials(username)
+            if sb_row:
+                if sb_verify_user_password(username, password):
+                    st.session_state.is_authenticated = True
+                    st.session_state.current_user = username
+                    st.session_state.auth_source = "supabase"
+                    st.success("Login successful.")
+                    st.rerun()
+                else:
+                    st.error("Invalid User ID or Password.")
+                    st.stop()
+
+        # Secrets-based fallback (backwards compatible)
         allowed_users = st.secrets.get("auth", {}).get("users", {})
         salt = st.secrets.get("auth", {}).get("salt", "")
 
@@ -1717,12 +1849,14 @@ def require_login():
 
         if hmac.compare_digest(computed_hash, expected_hash):
             st.session_state.is_authenticated = True
-            st.session_state.current_user = username  # used for per-user state keys
+            st.session_state.current_user = username
+            st.session_state.auth_source = "secrets"
             st.success("Login successful.")
             st.rerun()
         else:
             st.error("Invalid User ID or Password.")
             st.stop()
+
 
     st.stop()
 
@@ -3250,13 +3384,17 @@ def sb_checkbox(label: str, key: str, default: bool = False, **kwargs):
 def sb_slider(label: str, min_value, max_value, key: str, default=None, **kwargs):
     """Slider wrapper to avoid Streamlit's 'default + session_state' warning.
 
-    If the key already exists in st.session_state (e.g., loaded from Supabase),
-    we call the slider WITHOUT passing an explicit default value.
+    Rule:
+    - If the key is already present in st.session_state (e.g., loaded from Supabase),
+      call the slider WITHOUT passing an explicit 'value' (Streamlit will use session_state).
+    - If the key is missing, pass the intended default via 'value' and let Streamlit
+      initialize session_state (do NOT set st.session_state[key] manually here).
     """
     if key not in st.session_state:
-        st.session_state[key] = default if default is not None else min_value
-        return st.sidebar.slider(label, min_value, max_value, value=st.session_state[key], key=key, **kwargs)
+        v = default if default is not None else min_value
+        return st.sidebar.slider(label, min_value, max_value, value=v, key=key, **kwargs)
     return st.sidebar.slider(label, min_value, max_value, key=key, **kwargs)
+
 
 
 def sb_selectbox(label: str, options, key: str, default_index: int = 0, **kwargs):
@@ -4925,3 +5063,124 @@ with tab5:
             mime="application/pdf",
             use_container_width=True,
         )
+
+
+# =============================================================================
+# PASSWORD MANAGEMENT (APPENDED AT END TO AVOID CHANGING EXISTING SIDEBAR WIDGET IDS)
+# =============================================================================
+def _render_password_management_sidebar():
+    if not st.session_state.get("is_authenticated", False):
+        return
+    _u = st.session_state.get("current_user") or ""
+    if not _u:
+        return
+
+    # -----------------------------
+    # Change Password (post-login)
+    # -----------------------------
+    with st.sidebar.expander("Change Password", expanded=False):
+        if not _sb_enabled():
+            st.info("Password change requires Supabase to be configured for this app.")
+        else:
+            with st.form("change_password_form", clear_on_submit=True):
+                cur_pwd = st.text_input("Current password", type="password")
+                new_pwd = st.text_input("New password", type="password")
+                new_pwd2 = st.text_input("Confirm new password", type="password")
+                submitted_pw = st.form_submit_button("Update password")
+
+            if submitted_pw:
+                if not cur_pwd or not new_pwd or not new_pwd2:
+                    st.error("Please fill in all password fields.")
+                    st.stop()
+                if new_pwd != new_pwd2:
+                    st.error("New password and confirmation do not match.")
+                    st.stop()
+                if len(new_pwd) < 8:
+                    st.error("New password must be at least 8 characters.")
+                    st.stop()
+                if new_pwd == cur_pwd:
+                    st.error("New password must be different from the current password.")
+                    st.stop()
+
+                # Determine auth source by presence of Supabase row (enforced at login)
+                row = sb_get_user_credentials(_u) if _sb_enabled() else None
+                old_hash_for_log = None
+                if row:
+                    old_hash_for_log = row.get("password_hash")
+                    if not sb_verify_user_password(_u, cur_pwd):
+                        st.error("Current password is incorrect.")
+                        st.stop()
+                else:
+                    # secrets fallback verification
+                    allowed_users = st.secrets.get("auth", {}).get("users", {})
+                    salt = st.secrets.get("auth", {}).get("salt", "")
+                    expected_hash = allowed_users.get(_u)
+                    if not expected_hash or not salt:
+                        st.error("Secrets-based auth is not configured; cannot verify current password.")
+                        st.stop()
+                    old_hash_for_log = expected_hash
+                    computed_hash = _hash_password(cur_pwd, salt)
+                    if not hmac.compare_digest(computed_hash, expected_hash):
+                        st.error("Current password is incorrect.")
+                        st.stop()
+
+                ok = sb_set_user_password(
+                    _u,
+                    new_pwd,
+                    old_password_hash=str(old_hash_for_log) if old_hash_for_log else None,
+                    changed_by=_u,
+                    change_reason="user_initiated",
+                )
+                if ok:
+                    st.success("Password updated successfully. Please use the new password next time you sign in.")
+                    st.rerun()
+                else:
+                    st.error("Unable to update password due to a Supabase error. Please try again.")
+                    st.stop()
+
+    # -----------------------------
+    # Admin Reset (only for ranabir)
+    # -----------------------------
+    if _u == "ranabir":
+        with st.sidebar.expander("Admin: Reset User Password", expanded=False):
+            if not _sb_enabled():
+                st.info("Admin password reset requires Supabase to be configured for this app.")
+            else:
+                with st.form("admin_reset_password_form", clear_on_submit=True):
+                    target_user = st.text_input("Target user ID")
+                    admin_new_pwd = st.text_input("New password", type="password")
+                    admin_new_pwd2 = st.text_input("Confirm new password", type="password")
+                    submitted_admin = st.form_submit_button("Reset password")
+
+                if submitted_admin:
+                    if not target_user or not admin_new_pwd or not admin_new_pwd2:
+                        st.error("Please fill in all fields.")
+                        st.stop()
+                    if admin_new_pwd != admin_new_pwd2:
+                        st.error("New password and confirmation do not match.")
+                        st.stop()
+                    if len(admin_new_pwd) < 8:
+                        st.error("New password must be at least 8 characters.")
+                        st.stop()
+
+                    existing = sb_get_user_credentials(target_user)
+                    old_hash = existing.get("password_hash") if existing else None
+
+                    ok = sb_set_user_password(
+                        target_user,
+                        admin_new_pwd,
+                        old_password_hash=str(old_hash) if old_hash else None,
+                        changed_by=_u,
+                        change_reason="admin_reset",
+                        metadata={"reset_by": _u},
+                    )
+                    if ok:
+                        st.success(f"Password reset successfully for user '{target_user}'.")
+                        st.rerun()
+                    else:
+                        st.error("Unable to reset password due to a Supabase error. Please try again.")
+                        st.stop()
+
+# Render at the very end to avoid shifting any existing sidebar widgets / state
+_render_password_management_sidebar()
+
