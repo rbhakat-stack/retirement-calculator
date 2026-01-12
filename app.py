@@ -1183,6 +1183,15 @@ def _as_percent_display(x, default_pct=0.0):
     d = _as_decimal_rate(x, default=default_pct / 100.0)
     return d * 100.0
 
+
+def _as_float_with_default(value, default=0.0):
+    """Best-effort float coercion with a fallback default."""
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 def normalize_snapshot(s: dict) -> dict:
     """Return a NEW snapshot with consistent units (rates as decimals)."""
     s2 = copy.deepcopy(s or {})
@@ -1214,7 +1223,7 @@ def normalize_snapshot(s: dict) -> dict:
 
     for k in [
         "annual_spend_retirement", "social_security", "annual_contribution",
-        "current_portfolio", "cash_bal", "bonds_bal", "etfs_bal", "k401_bal"
+        "current_portfolio", "cash_bal", "bonds_bal", "etfs_bal", "k401_bal", "real_estate_bal", "misc_bal"
     ]:
         if k in s2 and s2[k] is not None:
             try:
@@ -2079,10 +2088,14 @@ def calculate_forecast_multi_asset(
     bonds_bal: float,
     etfs_bal: float,
     k401_bal: float,
+    real_estate_bal: float,
+    misc_bal: float,
     cash_yield: float,
     bonds_yield: float,
     etfs_yield: float,
     k401_yield: float,
+    real_estate_return: float,
+    misc_return: float,
     flow_mode: str = "pro_rata",  # "pro_rata" or "cash_first"
 ):
     max_age = life_expectancy
@@ -2094,6 +2107,8 @@ def calculate_forecast_multi_asset(
     m_bonds = bonds_yield / 12.0
     m_etfs = etfs_yield / 12.0
     m_k401 = k401_yield / 12.0
+    m_real_estate = real_estate_return / 12.0
+    m_misc = misc_return / 12.0
 
     m_spend = annual_spend_today / 12.0
     m_ss = social_security_annual_today / 12.0
@@ -2103,20 +2118,24 @@ def calculate_forecast_multi_asset(
     bonds = float(max(0, bonds_bal))
     etfs = float(max(0, etfs_bal))
     k401 = float(max(0, k401_bal))
+    real_estate = float(max(0, real_estate_bal))
+    misc = float(max(0, misc_bal))
 
     def total_pool():
-        return cash + bonds + etfs + k401
+        return cash + bonds + etfs + real_estate + misc + k401
 
     def allocate_surplus(amount: float):
-        nonlocal cash, bonds, etfs, k401
+        nonlocal cash, bonds, etfs, real_estate, misc, k401
         if amount <= 0:
             return
         pool = total_pool()
         if pool <= 0:
-            add = amount / 4.0
+            add = amount / 6.0
             cash += add
             bonds += add
             etfs += add
+            real_estate += add
+            misc += add
             k401 += add
             return
 
@@ -2124,18 +2143,20 @@ def calculate_forecast_multi_asset(
             cash += amount * (cash / pool) if cash > 0 else 0
             bonds += amount * (bonds / pool) if bonds > 0 else 0
             etfs += amount * (etfs / pool) if etfs > 0 else 0
+            real_estate += amount * (real_estate / pool) if real_estate > 0 else 0
+            misc += amount * (misc / pool) if misc > 0 else 0
             k401 += amount * (k401 / pool) if k401 > 0 else 0
         else:
             cash += amount
 
     def withdraw_deficit(amount: float):
-        nonlocal cash, bonds, etfs, k401
+        nonlocal cash, bonds, etfs, real_estate, misc, k401
         if amount <= 0:
             return
 
         if flow_mode == "cash_first":
-            for name in ["cash", "bonds", "etfs", "k401"]:
-                bal = {"cash": cash, "bonds": bonds, "etfs": etfs, "k401": k401}[name]
+            for name in ["cash", "bonds", "etfs", "real_estate", "misc", "k401"]:
+                bal = {"cash": cash, "bonds": bonds, "etfs": etfs, "real_estate": real_estate, "misc": misc, "k401": k401}[name]
                 if amount <= 0:
                     break
                 take = min(amount, bal)
@@ -2146,6 +2167,10 @@ def calculate_forecast_multi_asset(
                     bonds -= take
                 if name == "etfs":
                     etfs -= take
+                if name == "real_estate":
+                    real_estate -= take
+                if name == "misc":
+                    misc -= take
                 if name == "k401":
                     k401 -= take
         else:
@@ -2157,11 +2182,15 @@ def calculate_forecast_multi_asset(
             cash -= cash * ratio
             bonds -= bonds * ratio
             etfs -= etfs * ratio
+            real_estate -= real_estate * ratio
+            misc -= misc * ratio
             k401 -= k401 * ratio
 
         cash = max(0.0, cash)
         bonds = max(0.0, bonds)
         etfs = max(0.0, etfs)
+        real_estate = max(0.0, real_estate)
+        misc = max(0.0, misc)
         k401 = max(0.0, k401)
 
     rows = []
@@ -2175,6 +2204,8 @@ def calculate_forecast_multi_asset(
             "Cash": cash,
             "Bonds": bonds,
             "ETFs": etfs,
+            "Real Estate": real_estate,
+            "Misc": misc,
             "401k": k401,
             "End Balance": total_pool(),
         }
@@ -2191,6 +2222,8 @@ def calculate_forecast_multi_asset(
         cash *= (1.0 + m_cash)
         bonds *= (1.0 + m_bonds)
         etfs *= (1.0 + m_etfs)
+        real_estate *= (1.0 + m_real_estate)
+        misc *= (1.0 + m_misc)
         k401 *= (1.0 + m_k401)
 
         guaranteed_month = m_ss if sim_age >= ss_start_age else 0.0
@@ -2212,9 +2245,11 @@ def calculate_forecast_multi_asset(
                     "Guaranteed Income": guaranteed_month * 12.0,
                     "Portfolio Withdrawal": monthly_need * 12.0,
                     "Cash": cash,
-                    "Bonds": bonds,
-                    "ETFs": etfs,
-                    "401k": k401,
+            "Bonds": bonds,
+            "ETFs": etfs,
+            "Real Estate": real_estate,
+            "Misc": misc,
+            "401k": k401,
                     "End Balance": total_pool(),
                 }
             )
@@ -2229,9 +2264,11 @@ def calculate_forecast_multi_asset(
                         "Guaranteed Income": guaranteed_month * 12.0,
                         "Portfolio Withdrawal": monthly_need * 12.0,
                         "Cash": cash,
-                        "Bonds": bonds,
-                        "ETFs": etfs,
-                        "401k": k401,
+            "Bonds": bonds,
+            "ETFs": etfs,
+            "Real Estate": real_estate,
+            "Misc": misc,
+            "401k": k401,
                         "End Balance": 0.0,
                     }
                 )
@@ -2292,6 +2329,10 @@ def get_current_inputs_snapshot() -> dict:
         "etfs_yield": float(st.session_state.get("etfs_yield", 0.07)),
         "k401_bal": float(st.session_state.get("k401_bal", 200_000)),
         "k401_yield": float(st.session_state.get("k401_yield", 0.07)),
+        "real_estate_bal": float(st.session_state.get("real_estate_bal", 0.0)),
+        "real_estate_return": float(st.session_state.get("real_estate_return", 0.04)),
+        "misc_bal": float(st.session_state.get("misc_bal", 0.0)),
+        "misc_return": float(st.session_state.get("misc_return", 0.05)),
         "annual_gross_income": float(st.session_state.get("annual_gross_income", 300_000)),
         "filing_status": st.session_state.get("filing_status", "married"),
         "state_code": st.session_state.get("state_code", "NJ"),
@@ -2375,10 +2416,14 @@ def run_projection_from_snapshot(s: dict) -> pd.DataFrame:
             bonds_bal=s.get("bonds_bal", 0.0),
             etfs_bal=s.get("etfs_bal", 0.0),
             k401_bal=s.get("k401_bal", 0.0),
+            real_estate_bal=s.get("real_estate_bal", 0.0),
+            misc_bal=s.get("misc_bal", 0.0),
             cash_yield=s.get("cash_yield", 0.0),
             bonds_yield=s.get("bonds_yield", 0.0),
             etfs_yield=s.get("etfs_yield", 0.0),
             k401_yield=s.get("k401_yield", 0.0),
+            real_estate_return=s.get("real_estate_return", 0.0),
+            misc_return=s.get("misc_return", 0.0),
             flow_mode=s.get("flow_mode", "cash_first"),
         )
 
@@ -3498,7 +3543,13 @@ with tab1:
         k401_bal = sb_num("401k Balance ($)", key="k401_bal", default=200_000.0, min_value=0.0, step=10_000.0)
         k401_yield = sb_slider("401k Return (%)", 0.0, 12.0, key="k401_yield", default=7.0, step=0.1) / 100
 
-        buckets_sum = cash_bal + bonds_bal + etfs_bal + k401_bal
+
+        real_estate_bal = sb_num("Real Estate Balance ($)", key="real_estate_bal", default=0.0, min_value=0.0, step=10_000.0)
+        real_estate_return = sb_slider("Real Estate Return (%)", 0.0, 12.0, key="real_estate_return", default=4.0, step=0.1) / 100
+
+        misc_bal = sb_num("Misc. Assets Balance ($) (Intl, Alts, etc.)", key="misc_bal", default=0.0, min_value=0.0, step=10_000.0)
+        misc_return = sb_slider("Misc. Assets Return (%)", 0.0, 12.0, key="misc_return", default=5.0, step=0.1) / 100
+        buckets_sum = cash_bal + bonds_bal + etfs_bal + k401_bal + real_estate_bal + misc_bal
         if abs(buckets_sum - current_portfolio) > 50_000:
             st.sidebar.warning(
                 f"Bucket sum (${buckets_sum:,.0f}) differs from Total Invested Assets (${current_portfolio:,.0f}). "
@@ -3609,10 +3660,14 @@ with tab1:
             bonds_bal=bonds_bal,
             etfs_bal=etfs_bal,
             k401_bal=k401_bal,
+            real_estate_bal=real_estate_bal,
+            misc_bal=misc_bal,
             cash_yield=cash_yield,
             bonds_yield=bonds_yield,
             etfs_yield=etfs_yield,
             k401_yield=k401_yield,
+            real_estate_return=real_estate_return,
+            misc_return=misc_return,
             flow_mode=flow_mode,
         )
     else:
@@ -3960,7 +4015,7 @@ with tab1:
                 st.success(f"Sustainability: Sustainable to {life_expectancy}")
 
         fig, ax = plt.subplots(figsize=(10, 5))
-        if use_multi_asset and all(col in df.columns for col in ["Cash", "Bonds", "ETFs", "401k"]):
+        if use_multi_asset and all(col in df.columns for col in ["Cash", "Bonds", "ETFs", "Real Estate", "Misc", "401k"]):
             ax.stackplot(
                 df["Age"],
                 df["Cash"],
@@ -4000,7 +4055,9 @@ with tab1:
             ]
             for col in money_cols:
                 if col in display_df.columns:
-                    display_df[col] = display_df[col].round(0).astype(int)
+                    _s = pd.to_numeric(display_df[col], errors="coerce")
+                    _s = _s.replace([np.inf, -np.inf], np.nan).round(0)
+                    display_df[col] = _s.astype("Int64")
 
             st.dataframe(display_df, use_container_width=True)
 
@@ -4412,6 +4469,41 @@ with tab2:
                 working["k401_bal"] = st.number_input("401k balance ($)", value=float(working.get("k401_bal", 200000)), key=prefix+"k401_bal")
                 ky = st.slider("401k return (%)", 0.0, 12.0, _as_percent_display(working.get("k401_yield", 0.07), 7.0), 0.1, key=prefix+"k401_y")
                 working["k401_yield"] = ky / 100.0
+
+                working["real_estate_bal"] = st.number_input(
+                    "Real Estate balance ($)",
+                    min_value=0.0,
+                    value=float(working.get("real_estate_bal", 0.0)),
+                    step=1000.0,
+                    key=prefix+"real_estate_bal",
+                )
+                ry = st.slider(
+                    "Real Estate return (%)",
+                    0.0,
+                    12.0,
+                    _as_float_with_default(working.get("real_estate_return", 0.05), 5.0),
+                    0.1,
+                    key=prefix+"real_estate_r",
+                )
+                working["real_estate_return"] = ry / 100.0
+
+                working["misc_bal"] = st.number_input(
+                    "Misc. balance ($) (Intl assets etc.)",
+                    min_value=0.0,
+                    value=float(working.get("misc_bal", 0.0)),
+                    step=1000.0,
+                    key=prefix+"misc_bal",
+                )
+                my = st.slider(
+                    "Misc. return (%)",
+                    0.0,
+                    12.0,
+                    _as_float_with_default(working.get("misc_return", 0.05), 5.0),
+                    0.1,
+                    key=prefix+"misc_r",
+                )
+                working["misc_return"] = my / 100.0
+
             else:
                 working["current_portfolio"] = st.number_input("Total invested assets ($)", value=float(working.get("current_portfolio", 1239000)), key=prefix+"total")
 
