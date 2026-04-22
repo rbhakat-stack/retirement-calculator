@@ -1813,59 +1813,184 @@ def sb_set_user_password(
 
     return True
 
+_EMAIL_RE = __import__("re").compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def _is_valid_email(s: str) -> bool:
+    try:
+        return bool(_EMAIL_RE.match((s or "").strip()))
+    except Exception:
+        return False
+
+def sb_create_user(
+    user_id: str,
+    password: str,
+    first_name: str,
+    last_name: str,
+    email: str,
+) -> tuple[bool, str]:
+    """
+    Create a brand new Supabase-backed user. Returns (ok, message).
+    Fails if the user already exists or Supabase is unavailable.
+    """
+    if not _sb_enabled():
+        return False, "Sign-up is currently unavailable. Please contact the administrator."
+    uid = (user_id or "").strip()
+    if not uid:
+        return False, "Email / User ID is required."
+    # Uniqueness check
+    try:
+        if sb_get_user_credentials(uid) is not None:
+            return False, "An account with this email already exists. Please sign in instead."
+    except Exception:
+        pass
+    # Perform the upsert directly so we can surface the real Supabase error
+    client = get_supabase_client()
+    if client is None:
+        return False, "Sign-up is currently unavailable (no Supabase client)."
+
+    salt = _new_salt()
+    iterations = 200_000
+    new_hash = _hash_password_v2(password, salt, iterations=iterations)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cred_payload = {
+        "user_id": uid,
+        "password_hash": new_hash,
+        "salt": salt,
+        "algo": "pbkdf2_sha256",
+        "iterations": iterations,
+        "updated_at": now_iso,
+        "is_active": True,
+    }
+    cred_payload["created_at"] = now_iso
+    try:
+        client.table(_sb_auth_table()).insert(cred_payload).execute()
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_create_user insert failed: {e}")
+        return False, f"Could not create account: {e}"
+
+    # Best-effort change log (carries first/last/email metadata); never blocks signup
+    try:
+        client.table(_sb_password_changes_table()).insert({
+            "id": str(uuid.uuid4()),
+            "user_id": uid,
+            "old_password_hash": None,
+            "new_password_hash": new_hash,
+            "changed_at": now_iso,
+            "changed_by": uid,
+            "change_reason": "signup",
+            "metadata": {
+                "first_name": (first_name or "").strip(),
+                "last_name":  (last_name or "").strip(),
+                "email":      (email or uid).strip(),
+            },
+        }).execute()
+    except Exception as e:
+        _sb_debug_log(f"WARN: sb_create_user change-log insert failed (non-fatal): {e}")
+
+    return True, "Account created."
+
 def require_login():
     if st.session_state.get("is_authenticated", False):
         return
 
-    st.title("Login Required")
-    st.caption("Enter your credentials to access the application.")
+    st.title("Welcome")
+    st.caption("Sign in to your account, or create a new one to get started.")
 
-    with st.form("login_form", clear_on_submit=False):
-        username = st.text_input("User ID")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in")
+    login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
 
+    # -------- LOGIN TAB (existing behavior preserved) --------
+    with login_tab:
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("User ID")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in")
 
-    if submitted:
-        # If Supabase credentials exist for this user, enforce Supabase auth.
-        if _sb_enabled():
-            sb_row = sb_get_user_credentials(username)
-            if sb_row:
-                if sb_verify_user_password(username, password):
-                    st.session_state.is_authenticated = True
-                    st.session_state.current_user = username
-                    st.session_state.auth_source = "supabase"
-                    st.success("Login successful.")
-                    st.rerun()
-                else:
-                    st.error("Invalid User ID or Password.")
+        if submitted:
+            # If Supabase credentials exist for this user, enforce Supabase auth.
+            if _sb_enabled():
+                sb_row = sb_get_user_credentials(username)
+                if sb_row:
+                    if sb_verify_user_password(username, password):
+                        st.session_state.is_authenticated = True
+                        st.session_state.current_user = username
+                        st.session_state.auth_source = "supabase"
+                        st.success("Login successful.")
+                        st.rerun()
+                    else:
+                        st.error("Invalid User ID or Password.")
+                        st.stop()
+
+            # Secrets-based fallback (backwards compatible)
+            allowed_users = st.secrets.get("auth", {}).get("users", {})
+            salt = st.secrets.get("auth", {}).get("salt", "")
+
+            if not salt or not allowed_users:
+                st.error("Auth is not configured. Please add [auth] secrets (salt + users).")
+                st.stop()
+
+            expected_hash = allowed_users.get(username)
+            if not expected_hash:
+                st.error("Invalid User ID or Password.")
+                st.stop()
+
+            computed_hash = _hash_password(password, salt)
+
+            if hmac.compare_digest(computed_hash, expected_hash):
+                st.session_state.is_authenticated = True
+                st.session_state.current_user = username
+                st.session_state.auth_source = "secrets"
+                st.success("Login successful.")
+                st.rerun()
+            else:
+                st.error("Invalid User ID or Password.")
+                st.stop()
+
+    # -------- SIGN-UP TAB (new) --------
+    with signup_tab:
+        if not _sb_enabled():
+            st.info("Self sign-up is not enabled on this deployment. Please contact the administrator.")
+        else:
+            with st.form("signup_form", clear_on_submit=False):
+                c1, c2 = st.columns(2)
+                with c1:
+                    su_first = st.text_input("First name")
+                with c2:
+                    su_last = st.text_input("Last name")
+                su_email = st.text_input("Email (this will be your User ID)")
+                su_pw1 = st.text_input("Password", type="password", help="Minimum 8 characters.")
+                su_pw2 = st.text_input("Confirm password", type="password")
+                su_submitted = st.form_submit_button("Create account")
+
+            if su_submitted:
+                errors = []
+                if not (su_first or "").strip():
+                    errors.append("First name is required.")
+                if not (su_last or "").strip():
+                    errors.append("Last name is required.")
+                if not _is_valid_email(su_email):
+                    errors.append("Please enter a valid email address.")
+                if len(su_pw1 or "") < 8:
+                    errors.append("Password must be at least 8 characters.")
+                if su_pw1 != su_pw2:
+                    errors.append("Passwords do not match.")
+
+                if errors:
+                    for m in errors:
+                        st.error(m)
                     st.stop()
 
-        # Secrets-based fallback (backwards compatible)
-        allowed_users = st.secrets.get("auth", {}).get("users", {})
-        salt = st.secrets.get("auth", {}).get("salt", "")
+                uid = (su_email or "").strip().lower()
+                ok, msg = sb_create_user(uid, su_pw1, su_first, su_last, uid)
+                if not ok:
+                    st.error(msg)
+                    st.stop()
 
-        if not salt or not allowed_users:
-            st.error("Auth is not configured. Please add [auth] secrets (salt + users).")
-            st.stop()
-
-        expected_hash = allowed_users.get(username)
-        if not expected_hash:
-            st.error("Invalid User ID or Password.")
-            st.stop()
-
-        computed_hash = _hash_password(password, salt)
-
-        if hmac.compare_digest(computed_hash, expected_hash):
-            st.session_state.is_authenticated = True
-            st.session_state.current_user = username
-            st.session_state.auth_source = "secrets"
-            st.success("Login successful.")
-            st.rerun()
-        else:
-            st.error("Invalid User ID or Password.")
-            st.stop()
-
+                st.session_state.is_authenticated = True
+                st.session_state.current_user = uid
+                st.session_state.auth_source = "supabase"
+                st.session_state["signup_display_name"] = f"{(su_first or '').strip()} {(su_last or '').strip()}".strip()
+                st.success("Account created. Signing you in…")
+                st.rerun()
 
     st.stop()
 
