@@ -1235,7 +1235,7 @@ def normalize_snapshot(s: dict) -> dict:
 
 def _sb_scenarios_table() -> str:
     return st.secrets.get("supabase", {}).get("scenarios_table", "scenarios")
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # -----------------------------------------------------------------------------
 # RATE NORMALIZATION HELPERS (prevents percent/decimal confusion)
@@ -1735,7 +1735,7 @@ def sb_get_user_credentials(user_id: str) -> dict | None:
     try:
         res = (
             client.table(_sb_auth_table())
-            .select("user_id,password_hash,salt,algo,iterations,updated_at,created_at,is_active")
+            .select("user_id,password_hash,salt,algo,iterations,updated_at,created_at,is_active,is_verified")
             .eq("user_id", user_id)
             .maybe_single()
             .execute()
@@ -1821,6 +1821,164 @@ def _is_valid_email(s: str) -> bool:
     except Exception:
         return False
 
+# -----------------------------------------------------------------------------
+# EMAIL VERIFICATION (self-signup only — legacy [auth.users] unaffected)
+# -----------------------------------------------------------------------------
+VERIFICATION_TTL_HOURS = 24
+
+def _app_base_url() -> str:
+    """Public base URL used to build the verification link."""
+    try:
+        cfg = st.secrets.get("email", {}) or {}
+        url = (cfg.get("app_base_url") or "").strip()
+        if url:
+            return url.rstrip("/")
+    except Exception:
+        pass
+    return "http://localhost:8501"
+
+def _new_verification_token() -> str:
+    try:
+        return secrets.token_urlsafe(32)
+    except Exception:
+        return uuid.uuid4().hex + uuid.uuid4().hex
+
+def _build_verification_link(user_id: str, token: str) -> str:
+    from urllib.parse import quote
+    return f"{_app_base_url()}/?verify_token={quote(token)}&email={quote(user_id)}"
+
+def send_verification_email(email: str, verification_link: str) -> tuple[bool, str]:
+    """
+    Minimal SMTP sender. Pluggable: if no [email] SMTP secrets are set,
+    we skip sending and return ok=False so the UI can show the link directly
+    (useful for local dev). Never raises.
+    """
+    try:
+        cfg = st.secrets.get("email", {}) or {}
+    except Exception:
+        cfg = {}
+    host = cfg.get("smtp_host")
+    port = int(cfg.get("smtp_port", 587) or 587)
+    user = cfg.get("smtp_username")
+    pw   = cfg.get("smtp_password")
+    sender = cfg.get("from_address") or user
+    if not (host and user and pw and sender):
+        _sb_debug_log("WARN: [email] SMTP not configured; skipping send_verification_email")
+        return False, "SMTP not configured"
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Verify your Retirement Planner account"
+        msg["From"] = sender
+        msg["To"] = email
+        text = (
+            f"Welcome! Please verify your email by clicking the link below:\n\n"
+            f"{verification_link}\n\n"
+            f"This link expires in {VERIFICATION_TTL_HOURS} hours."
+        )
+        html = (
+            f"<p>Welcome! Please verify your email by clicking the link below:</p>"
+            f"<p><a href='{verification_link}'>Verify my account</a></p>"
+            f"<p>This link expires in {VERIFICATION_TTL_HOURS} hours.</p>"
+        )
+        msg.attach(MIMEText(text, "plain"))
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP(host, port) as server:
+            server.starttls()
+            server.login(user, pw)
+            server.sendmail(sender, [email], msg.as_string())
+        return True, "sent"
+    except Exception as e:
+        _sb_debug_log(f"ERROR: send_verification_email failed: {e}")
+        return False, str(e)
+
+def sb_mark_verified(user_id: str, token: str) -> tuple[bool, str]:
+    """Validate token+expiry; if valid, flip is_verified=True and clear token."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Service unavailable."
+    uid = (user_id or "").strip().lower()
+    tok = (token or "").strip()
+    if not uid or not tok:
+        return False, "Invalid verification link."
+    try:
+        res = (
+            client.table(_sb_auth_table())
+            .select("user_id,is_verified,verification_token,verification_token_expires_at")
+            .eq("user_id", uid)
+            .maybe_single()
+            .execute()
+        )
+        row = getattr(res, "data", None) or None
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_mark_verified lookup failed: {e}")
+        return False, "Could not verify link."
+    if not row:
+        return False, "Account not found."
+    if row.get("is_verified"):
+        return True, "Your email is already verified. You can sign in."
+    if not row.get("verification_token") or not hmac.compare_digest(
+        str(row.get("verification_token")), tok
+    ):
+        return False, "Invalid or expired verification link."
+    # Expiry check
+    try:
+        exp_str = row.get("verification_token_expires_at")
+        if exp_str:
+            exp = datetime.fromisoformat(str(exp_str).replace("Z", "+00:00"))
+            if exp < datetime.now(timezone.utc):
+                return False, "Verification link has expired. Please request a new one."
+    except Exception:
+        pass
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        client.table(_sb_auth_table()).update({
+            "is_verified": True,
+            "verified_at": now_iso,
+            "verification_token": None,
+            "verification_token_expires_at": None,
+            "updated_at": now_iso,
+        }).eq("user_id", uid).execute()
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_mark_verified update failed: {e}")
+        return False, "Could not complete verification."
+    return True, "Email verified. You can now sign in."
+
+def sb_reissue_verification(user_id: str) -> tuple[bool, str]:
+    """Issue a fresh token+email for an existing unverified self-signup user."""
+    client = get_supabase_client()
+    if client is None:
+        return False, "Service unavailable."
+    uid = (user_id or "").strip().lower()
+    row = sb_get_user_credentials(uid)
+    if not row:
+        # Do not leak existence beyond current design
+        return True, "If that account exists, a verification email has been sent."
+    if row.get("is_verified"):
+        return True, "Your email is already verified. Please sign in."
+    token = _new_verification_token()
+    expires = (datetime.now(timezone.utc) + timedelta(hours=VERIFICATION_TTL_HOURS)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        client.table(_sb_auth_table()).update({
+            "verification_token": token,
+            "verification_token_expires_at": expires,
+            "verification_email_sent_at": now_iso,
+            "updated_at": now_iso,
+        }).eq("user_id", uid).execute()
+    except Exception as e:
+        _sb_debug_log(f"ERROR: sb_reissue_verification update failed: {e}")
+        return False, "Could not generate a new verification link."
+    link = _build_verification_link(uid, token)
+    sent_ok, _ = send_verification_email(uid, link)
+    # In dev (no SMTP), return link so admin/user can copy it.
+    if not sent_ok:
+        return True, f"Verification email could not be sent automatically. Use this link: {link}"
+    return True, "A new verification email has been sent."
+
+
 def sb_create_user(
     user_id: str,
     password: str,
@@ -1852,6 +2010,8 @@ def sb_create_user(
     iterations = 200_000
     new_hash = _hash_password_v2(password, salt, iterations=iterations)
     now_iso = datetime.now(timezone.utc).isoformat()
+    token = _new_verification_token()
+    expires_iso = (datetime.now(timezone.utc) + timedelta(hours=VERIFICATION_TTL_HOURS)).isoformat()
     cred_payload = {
         "user_id": uid,
         "password_hash": new_hash,
@@ -1859,14 +2019,23 @@ def sb_create_user(
         "algo": "pbkdf2_sha256",
         "iterations": iterations,
         "updated_at": now_iso,
+        "created_at": now_iso,
         "is_active": True,
+        "is_verified": False,
+        "verification_token": token,
+        "verification_token_expires_at": expires_iso,
+        "verification_email_sent_at": now_iso,
     }
-    cred_payload["created_at"] = now_iso
     try:
         client.table(_sb_auth_table()).insert(cred_payload).execute()
     except Exception as e:
         _sb_debug_log(f"ERROR: sb_create_user insert failed: {e}")
         return False, f"Could not create account: {e}"
+
+    # Send verification email (best-effort; surface link if SMTP is absent)
+    link = _build_verification_link(uid, token)
+    sent_ok, _send_msg = send_verification_email(uid, link)
+    st.session_state["_last_verification_link"] = link if not sent_ok else ""
 
     # Best-effort change log (carries first/last/email metadata); never blocks signup
     try:
@@ -1889,16 +2058,52 @@ def sb_create_user(
 
     return True, "Account created."
 
+def _consume_verification_query_params():
+    """If URL has ?verify_token=...&email=..., attempt verification and show result."""
+    try:
+        qp = st.query_params  # Streamlit >= 1.30
+        token = qp.get("verify_token")
+        em = qp.get("email")
+    except Exception:
+        try:
+            qp = st.experimental_get_query_params()
+            token = (qp.get("verify_token") or [None])[0]
+            em = (qp.get("email") or [None])[0]
+        except Exception:
+            token, em = None, None
+    if isinstance(token, list):
+        token = token[0] if token else None
+    if isinstance(em, list):
+        em = em[0] if em else None
+    if not token or not em:
+        return
+    ok, msg = sb_mark_verified(em, token)
+    # Clear the params so refresh doesn't re-trigger
+    try:
+        st.query_params.clear()
+    except Exception:
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
+    if ok:
+        st.success(msg)
+    else:
+        st.error(msg)
+
 def require_login():
     if st.session_state.get("is_authenticated", False):
         return
+
+    # Handle email verification links before showing the auth UI
+    _consume_verification_query_params()
 
     st.title("Welcome")
     st.caption("Sign in to your account, or create a new one to get started.")
 
     login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
 
-    # -------- LOGIN TAB (existing behavior preserved) --------
+    # -------- LOGIN TAB (existing behavior preserved; verification gate added for Supabase users) --------
     with login_tab:
         with st.form("login_form", clear_on_submit=False):
             username = st.text_input("User ID")
@@ -1911,6 +2116,12 @@ def require_login():
                 sb_row = sb_get_user_credentials(username)
                 if sb_row:
                     if sb_verify_user_password(username, password):
+                        # NEW: gate on email verification for self-signup users.
+                        # Treat missing/None as unverified; only True passes.
+                        if sb_row.get("is_verified") is not True:
+                            st.session_state["_unverified_user"] = (username or "").strip().lower()
+                            st.error("Please verify your email before logging in.")
+                            st.stop()
                         st.session_state.is_authenticated = True
                         st.session_state.current_user = username
                         st.session_state.auth_source = "supabase"
@@ -1920,7 +2131,7 @@ def require_login():
                         st.error("Invalid User ID or Password.")
                         st.stop()
 
-            # Secrets-based fallback (backwards compatible)
+            # Secrets-based fallback (backwards compatible) — legacy users untouched
             allowed_users = st.secrets.get("auth", {}).get("users", {})
             salt = st.secrets.get("auth", {}).get("salt", "")
 
@@ -1945,7 +2156,15 @@ def require_login():
                 st.error("Invalid User ID or Password.")
                 st.stop()
 
-    # -------- SIGN-UP TAB (new) --------
+        # Resend verification — only visible after an unverified login attempt
+        _pending = st.session_state.get("_unverified_user")
+        if _pending:
+            with st.expander("Didn't receive the verification email?"):
+                if st.button("Resend verification email", key="resend_verify_btn"):
+                    ok, msg = sb_reissue_verification(_pending)
+                    (st.success if ok else st.error)(msg)
+
+    # -------- SIGN-UP TAB --------
     with signup_tab:
         if not _sb_enabled():
             st.info("Self sign-up is not enabled on this deployment. Please contact the administrator.")
@@ -1985,12 +2204,18 @@ def require_login():
                     st.error(msg)
                     st.stop()
 
-                st.session_state.is_authenticated = True
-                st.session_state.current_user = uid
-                st.session_state.auth_source = "supabase"
-                st.session_state["signup_display_name"] = f"{(su_first or '').strip()} {(su_last or '').strip()}".strip()
-                st.success("Account created. Signing you in…")
-                st.rerun()
+                # NEW: do NOT auto-login. Require email verification first.
+                st.success(
+                    "Account created. Please check your email to verify your account before logging in."
+                )
+                _dev_link = st.session_state.get("_last_verification_link") or ""
+                if _dev_link:
+                    st.info(
+                        "Email delivery is not configured on this deployment. "
+                        "Use this verification link (dev only):"
+                    )
+                    st.code(_dev_link, language="text")
+                st.stop()
 
     st.stop()
 
